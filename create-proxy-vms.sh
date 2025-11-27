@@ -47,55 +47,65 @@ scan_existing_proxies() {
   echo
   echo "=== ĐANG SCAN TẤT CẢ PROXY HIỆN CÓ (${VM_NAME_PREFIX}-N TRÊN MỌI REGION) ==="
 
-  # Tạm tắt -e để nếu một lệnh con lỗi thì vẫn scan tiếp
-  set +e
+  # Lấy toàn bộ VM trong project (name + zone)
+  local ROWS=()
+  if ! mapfile -t ROWS < <(gcloud compute instances list \
+                              --project="$PROJECT" \
+                              --format="value(name,zone)" 2>/dev/null); then
+    echo "⚠ Không lấy được danh sách VM."
+    echo
+    return
+  fi
+
+  if ((${#ROWS[@]} == 0)); then
+    echo "⚠ Không tìm thấy VM nào trong project."
+    echo
+    return
+  fi
 
   local COUNT=0
-
-  # Lấy toàn bộ VM trên project rồi lọc bằng bash
-  gcloud compute instances list \
-    --project="$PROJECT" \
-    --format="value(name,zone)" 2>/dev/null \
-  | while read -r NAME ZONE; do
-      [[ -z "$NAME" ]] && continue
-
-      # Chỉ lấy những VM có tên đúng format proxy-vm-N
-      if [[ ! "$NAME" =~ ^${VM_NAME_PREFIX}-[0-9]+$ ]]; then
-        continue
-      fi
-
-      if [[ $COUNT -eq 0 ]]; then
-        echo
-        echo "============= DASHBOARD TOÀN BỘ PROXY ĐANG CÓ ============="
-      fi
-      COUNT=$((COUNT+1))
-
-      # Đọc PROXY từ file trên VM (không coi thiếu file là lỗi)
-      PROXY_LINE="$(
-        gcloud compute ssh "$NAME" \
-          --zone="$ZONE" \
-          --project="$PROJECT" \
-          --quiet \
-          --command="sudo head -n 1 /root/proxy_info.txt 2>/dev/null || true" \
-          2>/dev/null || true
-      )"
-
-      if [[ -n "$PROXY_LINE" ]]; then
-        echo "$NAME ($ZONE): $PROXY_LINE"
-      else
-        echo "$NAME ($ZONE): (không đọc được /root/proxy_info.txt)"
-      fi
-    done
-
-  if [[ $COUNT -eq 0 ]]; then
-    echo "⚠ Không tìm thấy VM nào có tên dạng '${VM_NAME_PREFIX}-N'."
-  else
-    echo "==========================================================="
-  fi
   echo
+  echo "============= DASHBOARD TOÀN BỘ PROXY ĐANG CÓ ============="
 
-  # Bật lại -e
-  set -e
+  for ROW in "${ROWS[@]}"; do
+    # ROW dạng: "<name> <zone>"
+    local NAME ZONE
+    NAME="${ROW%% *}"
+    ZONE="${ROW##* }"
+
+    [[ -z "$NAME" ]] && continue
+
+    # Chỉ lấy những VM có tên đúng format proxy-vm-N
+    if [[ ! "$NAME" =~ ^${VM_NAME_PREFIX}-[0-9]+$ ]]; then
+      continue
+    fi
+
+    COUNT=$((COUNT + 1))
+
+    # Đọc PROXY từ file trên VM (không coi thiếu file là lỗi)
+    local PROXY_LINE
+    PROXY_LINE="$(
+      gcloud compute ssh "$NAME" \
+        --zone="$ZONE" \
+        --project="$PROJECT" \
+        --quiet \
+        --command="sudo head -n 1 /root/proxy_info.txt 2>/dev/null || true" \
+        2>/dev/null || true
+    )"
+
+    if [[ -n "$PROXY_LINE" ]]; then
+      echo "$NAME ($ZONE): $PROXY_LINE"
+    else
+      echo "$NAME ($ZONE): (không đọc được /root/proxy_info.txt)"
+    fi
+  done
+
+  if (( COUNT == 0 )); then
+    echo "⚠ Không tìm thấy VM nào có tên dạng '${VM_NAME_PREFIX}-N'."
+  fi
+
+  echo "==========================================================="
+  echo
 }
 
 #######################################
