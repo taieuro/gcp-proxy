@@ -3,9 +3,7 @@
 # - Mỗi lần chạy tạo THÊM NUM_VMS VM mới (tên tăng dần: proxy-vm-1,2,3...)
 # - Tạo firewall rule chung cho proxy ports (nếu chưa có)
 # - SSH song song vào từng VM MỚI và chạy install.sh tạo proxy
-# - Luôn in:
-#     + List proxy mới tạo
-#     + Dashboard full tất cả proxy hiện có trong project
+# - Cuối cùng in list proxy CỦA CÁC VM MỚI tạo trong lần chạy này
 #
 # Cách chạy:
 #   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
@@ -36,69 +34,6 @@ TAGS="proxy-vm,http-server,https-server,lb-health-check"
 
 FIREWALL_NAME="gcp-proxy-ports"  # Tên firewall rule cho proxy port
 PROXY_INSTALL_URL="https://raw.githubusercontent.com/taieuro/gcp-proxy/main/install.sh"
-
-# 👉 Option: luôn scan FULL proxy toàn project ở cuối (true/false)
-SCAN_ALL_AT_END="true"
-
-#######################################
-# HÀM: Scan tất cả proxy hiện có trên mọi region
-#######################################
-scan_existing_proxies() {
-  echo
-  echo "=== ĐANG SCAN TẤT CẢ PROXY HIỆN CÓ (${VM_NAME_PREFIX}-N TRÊN MỌI REGION) ==="
-
-  local TMP_DASH="/tmp/proxy-dashboard.$$"
-  : > "$TMP_DASH"
-
-  # Lấy toàn bộ VM trong project, rồi lọc bằng bash theo prefix
-  gcloud compute instances list \
-    --project="$PROJECT" \
-    --format="value(name,zone)" 2>/dev/null \
-  | while read -r NAME ZONE; do
-      [[ -z "$NAME" ]] && continue
-
-      # Chỉ lấy những VM có tên bắt đầu bằng proxy-vm-
-      case "$NAME" in
-        ${VM_NAME_PREFIX}-*)
-          # Đọc PROXY từ file trên VM (không coi thiếu file là lỗi)
-          PROXY_LINE="$(
-            gcloud compute ssh "$NAME" \
-              --zone="$ZONE" \
-              --project="$PROJECT" \
-              --quiet \
-              --command="sudo head -n 1 /root/proxy_info.txt 2>/dev/null || true" \
-              2>/dev/null || true
-          )"
-
-          if [[ -n "$PROXY_LINE" ]]; then
-            echo "$NAME ($ZONE): $PROXY_LINE" >> "$TMP_DASH"
-          else
-            echo "$NAME ($ZONE): (không đọc được /root/proxy_info.txt)" >> "$TMP_DASH"
-          fi
-          ;;
-        *)
-          # VM khác prefix thì bỏ qua
-          ;;
-      esac
-    done
-
-  if [[ ! -s "$TMP_DASH" ]]; then
-    echo
-    echo "============= DASHBOARD TOÀN BỘ PROXY ĐANG CÓ ============="
-    echo "⚠ Không tìm thấy VM nào có tên bắt đầu với '${VM_NAME_PREFIX}-'."
-    echo "==========================================================="
-    echo
-    rm -f "$TMP_DASH"
-    return
-  fi
-
-  echo
-  echo "============= DASHBOARD TOÀN BỘ PROXY ĐANG CÓ ============="
-  cat "$TMP_DASH"
-  echo "==========================================================="
-  echo
-  rm -f "$TMP_DASH"
-}
 
 #######################################
 # THÔNG TIN PROJECT
@@ -135,7 +70,6 @@ echo "Network       : $NETWORK"
 echo "Tags          : $TAGS"
 echo "Firewall rule : $FIREWALL_NAME (tcp:20000-60000, 0.0.0.0/0, target tag=proxy-vm)"
 echo "Proxy script  : $PROXY_INSTALL_URL"
-echo "Scan full cuối: $SCAN_ALL_AT_END"
 echo
 
 #######################################
@@ -201,9 +135,6 @@ done
 
 if [[ "${#NEW_VM_NAMES[@]}" -eq 0 ]]; then
   echo "⚠ Không có VM mới cần tạo (NUM_VMS = 0?). Kết thúc."
-  if [[ "$SCAN_ALL_AT_END" == "true" ]]; then
-    scan_existing_proxies
-  fi
   exit 0
 fi
 
@@ -228,10 +159,10 @@ if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
   if grep -q "IN_USE_ADDRESSES" "$TMP_ERR"; then
     echo
     echo "❗ Phát hiện lỗi quota IN_USE_ADDRESSES (hết số lượng IP external trong region $REGION)."
-    echo "   Không tạo thêm được VM mới."
+    echo "   Không tạo thêm được VM mới trong region này."
+    echo "   Các VM & proxy hiện có vẫn giữ nguyên, chỉ là lần chạy này không thêm VM mới."
     rm -f "$TMP_ERR"
-    # Trường hợp quota hết: luôn scan để bạn xem dashboard
-    scan_existing_proxies
+    # Thoát “êm” (exit 0) để lệnh curl | bash không bị báo lỗi đỏ
     exit 0
   fi
 
@@ -301,8 +232,8 @@ for VM_NAME in "${NEW_VM_NAMES[@]}"; do
     FAILED_VMS+=("$VM_NAME")
     echo "⚠ VM '$VM_NAME' cài proxy lỗi. Kiểm tra: $LOG_FILE"
     echo "---- Tail log $VM_NAME ----"
-      tail -n 20 "$LOG_FILE" || true
-      echo "----------------------------"
+    tail -n 20 "$LOG_FILE" || true
+    echo "----------------------------"
   fi
 done
 
@@ -324,11 +255,6 @@ if [[ "${#FAILED_VMS[@]}" -gt 0 ]]; then
   echo "  gcloud compute ssh ${FAILED_VMS[0]} --zone=$ZONE --project=$PROJECT"
   echo "  curl -s $PROXY_INSTALL_URL | sudo bash"
   echo
-fi
-
-# Scan full dashboard nếu option bật
-if [[ "$SCAN_ALL_AT_END" == "true" ]]; then
-  scan_existing_proxies
 fi
 
 echo "Hoàn tất."
