@@ -15,7 +15,7 @@ fi
 apt-get update -y
 apt-get install -y build-essential curl wget openssl
 
-# Dùng phiên bản CÓ THẬT: 0.9.5
+# Official working version with stable build folder
 VERSION="0.9.5"
 SRC="/usr/local/src"
 CONF="/usr/local/etc/3proxy"
@@ -35,7 +35,8 @@ cd "3proxy-${VERSION}"
 echo "[2/4] Building 3proxy..."
 make -f Makefile.Linux
 
-cp src/3proxy "$BIN"
+# FIXED: binary is in bin/ now, not in src/
+cp bin/3proxy "$BIN"
 chmod +x "$BIN"
 
 echo "[3/4] Generating random credentials..."
