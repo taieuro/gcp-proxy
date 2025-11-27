@@ -11,23 +11,12 @@ CONF="/usr/local/etc/3proxy"
 LOG="/var/log/3proxy"
 BIN="/usr/local/bin/3proxy"
 
-echo "=== 3proxy auto proxy installer ==="
-
 #--------------------------------------------------
-# 0. Đảm bảo đang chạy với quyền root
-#--------------------------------------------------
-if [ "$EUID" -ne 0 ]; then
-  echo "❌ Please run using: curl -s URL | sudo bash"
-  exit 1
-fi
-
-#--------------------------------------------------
-# 1. Nếu đã có proxy_info.txt -> in lại proxy, không cài lại
+# 0. Nếu đã có proxy_info.txt -> chỉ in lại, không "installer"
 #--------------------------------------------------
 if [ -f "$INFO_FILE" ]; then
   echo
-  echo "=== Detected existing proxy info at $INFO_FILE ==="
-  # Nếu có service 3proxy thì restart cho chắc
+  echo "=== Existing 3proxy configuration detected ==="
   if systemctl list-unit-files | grep -q '^3proxy\.service'; then
     echo "Restarting 3proxy service..."
     systemctl reset-failed 3proxy >/dev/null 2>&1 || true
@@ -37,11 +26,20 @@ if [ -f "$INFO_FILE" ]; then
   echo "Your proxy:"
   cat "$INFO_FILE"
   echo
-  echo "You can reuse the same command (curl ... | sudo bash) anytime to see this again."
+  echo "(Run this same command anytime to show it again.)"
   exit 0
 fi
 
-echo "No existing proxy detected. Creating a new one..."
+# Nếu tới đây nghĩa là chưa có proxy_info.txt -> lần cài đặt đầu tiên
+echo "=== 3proxy auto proxy installer (first-time setup) ==="
+
+#--------------------------------------------------
+# 1. Đảm bảo đang chạy với quyền root
+#--------------------------------------------------
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ Please run using: curl -s URL | sudo bash"
+  exit 1
+fi
 
 #--------------------------------------------------
 # 2. Cài các package cần thiết (chỉ lần đầu)
@@ -124,12 +122,18 @@ systemctl restart 3proxy
 
 #--------------------------------------------------
 # 6. Tự động tạo firewall rule nếu có gcloud & đủ quyền
+#    + log RÕ ràng đã tạo / đã tồn tại / bỏ qua / lỗi
 #--------------------------------------------------
+FW_STATUS="unknown"
+FW_REASON=""
+
 create_firewall_rule() {
   echo
-  echo "=== Checking/creating firewall rule gcp-proxy-ports (tcp:20000-60000) ==="
+  echo "=== Firewall: checking gcp-proxy-ports (tcp:20000-60000) ==="
 
   if ! command -v gcloud >/dev/null 2>&1; then
+    FW_STATUS="skipped"
+    FW_REASON="gcloud_not_found"
     echo "⚠ gcloud not found on this VM. Skipping auto firewall rule."
     return
   fi
@@ -145,6 +149,8 @@ create_firewall_rule() {
   NETWORK=${NETWORK_URL##*/}
 
   if [ -z "$PROJECT_ID" ] || [ -z "$NETWORK" ]; then
+    FW_STATUS="skipped"
+    FW_REASON="metadata_missing"
     echo "⚠ Cannot detect project/network from metadata. Skipping auto firewall rule."
     return
   fi
@@ -154,6 +160,8 @@ create_firewall_rule() {
 
   if gcloud compute firewall-rules describe gcp-proxy-ports \
       --project="$PROJECT_ID" >/dev/null 2>&1; then
+    FW_STATUS="exists"
+    FW_REASON="rule_already_exists"
     echo "✅ Firewall rule gcp-proxy-ports already exists. Skipping creation."
     return
   fi
@@ -166,8 +174,12 @@ create_firewall_rule() {
       --allow=tcp:20000-60000 \
       --direction=INGRESS \
       --source-ranges=0.0.0.0/0 >/dev/null 2>&1; then
+    FW_STATUS="created"
+    FW_REASON="created_ok"
     echo "✅ Firewall rule gcp-proxy-ports created successfully."
   else
+    FW_STATUS="failed"
+    FW_REASON="create_failed"
     echo "⚠ Failed to create firewall rule automatically."
     echo "  Please create this rule manually in VPC firewall:"
     echo "  - Name: gcp-proxy-ports"
@@ -200,6 +212,27 @@ echo "==============================================="
 echo
 echo "$PROXY" > "$INFO_FILE"
 echo "Saved to $INFO_FILE"
+echo
+
+echo "Firewall summary:"
+case "$FW_STATUS" in
+  created)
+    echo "- gcp-proxy-ports: created successfully (tcp:20000-60000 from 0.0.0.0/0)"
+    ;;
+  exists)
+    echo "- gcp-proxy-ports: already existed, no changes made."
+    ;;
+  skipped)
+    echo "- gcp-proxy-ports: skipped (reason: $FW_REASON)."
+    ;;
+  failed)
+    echo "- gcp-proxy-ports: FAILED to create automatically (see messages above)."
+    ;;
+  *)
+    echo "- gcp-proxy-ports: unknown status."
+    ;;
+esac
+
 echo
 echo "TIP:"
 echo "- Next time, just run the same command again to show this proxy:"
