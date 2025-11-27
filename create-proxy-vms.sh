@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Script chạy trong Cloud Shell để:
-# - Tạo nhiều VM GCP cho proxy
-# - Tạo firewall rule chung cho proxy ports
-# - SSH song song vào từng VM và chạy install.sh tạo proxy
+# - Mỗi lần chạy tạo THÊM NUM_VMS VM mới (tên tăng dần theo prefix-1,2,3,...)
+# - Tạo firewall rule chung cho proxy ports (nếu chưa có)
+# - SSH song song vào từng VM mới và chạy install.sh tạo proxy
+# - Cuối cùng in GOM LIST PROXY của các VM mới để dễ copy/paste
 #
-# Cách chạy:
+# Cách chạy (sau khi file này ở trên GitHub):
 #   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
 
 set -euo pipefail
@@ -12,7 +13,7 @@ set -euo pipefail
 #######################################
 # CẤU HÌNH CÓ THỂ SỬA
 #######################################
-NUM_VMS=3                        # Số VM muốn tạo
+NUM_VMS=2                        # Số VM MUỐN TẠO THÊM MỖI LẦN CHẠY
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
 
 REGION="asia-northeast1"         # Region (Tokyo)
@@ -60,7 +61,7 @@ echo "=== Thông tin cấu hình ==="
 echo "Project       : $PROJECT"
 echo "Region        : $REGION"
 echo "Zone          : $ZONE"
-echo "Số VM         : $NUM_VMS"
+echo "Số VM mới     : $NUM_VMS"
 echo "VM name prefix: $VM_NAME_PREFIX"
 echo "Machine type  : $MACHINE_TYPE"
 echo "Disk size     : $DISK_SIZE"
@@ -96,55 +97,73 @@ fi
 echo
 
 #######################################
-# BƯỚC 2: TẠO CÁC VM (1 LỆNH DUY NHẤT)
+# BƯỚC 2: XÁC ĐỊNH CHỈ SỐ VM TIẾP THEO & TẠO VM MỚI
 #######################################
-echo "=== Bước 2: Tạo các VM (nếu chưa tồn tại) ==="
+echo "=== Bước 2: Tìm chỉ số VM tiếp theo & tạo VM mới ==="
 
-VM_NAMES=()
-NEW_VM_NAMES=()
+# Lấy danh sách VM hiện có trong ZONE với tên dạng prefix-<số>
+EXISTING_NAMES="$(gcloud compute instances list \
+  --project="$PROJECT" \
+  --filter="zone:($ZONE) AND name ~ '^${VM_NAME_PREFIX}-[0-9]+$'" \
+  --format="value(name)" || true)"
 
-for i in $(seq 1 "$NUM_VMS"); do
-  VM_NAME="${VM_NAME_PREFIX}-${i}"
-  VM_NAMES+=("$VM_NAME")
+MAX_INDEX=0
 
-  if gcloud compute instances describe "$VM_NAME" \
-      --zone="$ZONE" \
-      --project="$PROJECT" >/dev/null 2>&1; then
-    echo "⚠ VM '$VM_NAME' đã tồn tại, bỏ qua tạo mới."
-  else
-    NEW_VM_NAMES+=("$VM_NAME")
-  fi
-done
-
-if [[ "${#NEW_VM_NAMES[@]}" -gt 0 ]]; then
-  echo "⏳ Đang tạo các VM mới: ${NEW_VM_NAMES[*]} ..."
-  gcloud compute instances create "${NEW_VM_NAMES[@]}" \
-    --project="$PROJECT" \
-    --zone="$ZONE" \
-    --machine-type="$MACHINE_TYPE" \
-    --image-family="$IMAGE_FAMILY" \
-    --image-project="$IMAGE_PROJECT" \
-    --boot-disk-size="$DISK_SIZE" \
-    --boot-disk-type="$DISK_TYPE" \
-    --network="$NETWORK" \
-    --tags="$TAGS"
-  echo "✅ Đã tạo xong các VM mới."
-else
-  echo "✅ Không có VM mới cần tạo."
+if [[ -n "$EXISTING_NAMES" ]]; then
+  while IFS= read -r NAME; do
+    [[ -z "$NAME" ]] && continue
+    # Lấy phần số sau cùng sau dấu '-'
+    IDX="${NAME##*-}"
+    if [[ "$IDX" =~ ^[0-9]+$ ]]; then
+      if (( IDX > MAX_INDEX )); then
+        MAX_INDEX=$IDX
+      fi
+    fi
+  done <<< "$EXISTING_NAMES"
 fi
 
+START_INDEX=$((MAX_INDEX + 1))
+END_INDEX=$((MAX_INDEX + NUM_VMS))
+
+echo "Số index hiện tại lớn nhất: $MAX_INDEX"
+echo "Sẽ tạo VM mới từ: ${VM_NAME_PREFIX}-${START_INDEX} đến ${VM_NAME_PREFIX}-${END_INDEX}"
+echo
+
+NEW_VM_NAMES=()
+for i in $(seq "$START_INDEX" "$END_INDEX"); do
+  NEW_VM_NAMES+=("${VM_NAME_PREFIX}-${i}")
+done
+
+if [[ "${#NEW_VM_NAMES[@]}" -eq 0 ]]; then
+  echo "⚠ Không có VM mới cần tạo (NUM_VMS = 0?). Kết thúc."
+  exit 0
+fi
+
+echo "⏳ Đang tạo các VM mới: ${NEW_VM_NAMES[*]} ..."
+gcloud compute instances create "${NEW_VM_NAMES[@]}" \
+  --project="$PROJECT" \
+  --zone="$ZONE" \
+  --machine-type="$MACHINE_TYPE" \
+  --image-family="$IMAGE_FAMILY" \
+  --image-project="$IMAGE_PROJECT" \
+  --boot-disk-size="$DISK_SIZE" \
+  --boot-disk-type="$DISK_TYPE" \
+  --network="$NETWORK" \
+  --tags="$TAGS"
+
+echo "✅ Đã tạo xong các VM mới."
 echo
 
 #######################################
-# BƯỚC 3: SSH SONG SONG VÀO TỪNG VM, CHẠY install.sh
+# BƯỚC 3: SSH SONG SONG VÀO TỪNG VM MỚI, CHẠY install.sh
 #######################################
-echo "=== Bước 3: Cài proxy trên từng VM (SSH song song) ==="
+echo "=== Bước 3: Cài proxy trên các VM mới (SSH song song) ==="
 echo
 
 declare -A LOG_FILES
 declare -A PIDS
 
-for VM_NAME in "${VM_NAMES[@]}"; do
+for VM_NAME in "${NEW_VM_NAMES[@]}"; do
   LOG_FILE="/tmp/${VM_NAME}.proxy.log"
   LOG_FILES["$VM_NAME"]="$LOG_FILE"
 
@@ -162,18 +181,18 @@ for VM_NAME in "${VM_NAMES[@]}"; do
 done
 
 echo
-echo "⏳ Đang đợi các VM cài proxy xong..."
+echo "⏳ Đang đợi các VM mới cài proxy xong..."
 echo
 
 declare -A PROXIES
 FAILED_VMS=()
 
-for VM_NAME in "${VM_NAMES[@]}"; do
+for VM_NAME in "${NEW_VM_NAMES[@]}"; do
   PID="${PIDS[$VM_NAME]}"
   LOG_FILE="${LOG_FILES[$VM_NAME]}"
 
   if wait "$PID"; then
-    # Tìm dòng PROXY: ... trong log
+    # Tìm dòng PROXY: ... trong log (do install.sh in ra)
     if grep -q "PROXY:" "$LOG_FILE"; then
       PROXY_LINE=$(grep "PROXY:" "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')
       PROXIES["$VM_NAME"]="$PROXY_LINE"
@@ -189,15 +208,15 @@ for VM_NAME in "${VM_NAMES[@]}"; do
 done
 
 echo
-echo "================= TỔNG HỢP PROXY ĐÃ TẠO ================="
-for VM_NAME in "${VM_NAMES[@]}"; do
+echo "================= TỔNG HỢP PROXY MỚI ĐÃ TẠO ================="
+for VM_NAME in "${NEW_VM_NAMES[@]}"; do
   if [[ -n "${PROXIES[$VM_NAME]:-}" ]]; then
     echo "$VM_NAME: ${PROXIES[$VM_NAME]}"
   else
     echo "$VM_NAME: (FAILED - xem log: ${LOG_FILES[$VM_NAME]})"
   fi
 done
-echo "========================================================="
+echo "============================================================="
 echo
 
 if [[ "${#FAILED_VMS[@]}" -gt 0 ]]; then
