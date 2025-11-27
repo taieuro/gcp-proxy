@@ -8,14 +8,14 @@ echo "=== Installing 3proxy (auto proxy generator) ==="
 
 # Ensure root
 if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root: sudo bash install.sh"
+  echo "Please run using: curl -s URL | sudo bash"
   exit 1
 fi
 
 apt-get update -y >/dev/null
 apt-get install -y build-essential curl wget openssl >/dev/null
 
-VERSION="0.9.4"
+VERSION="0.9.6"
 SRC="/usr/local/src"
 CONF="/usr/local/etc/3proxy"
 LOG="/var/log/3proxy"
@@ -23,20 +23,22 @@ BIN="/usr/local/bin/3proxy"
 
 mkdir -p "$SRC" "$CONF" "$LOG"
 
-echo "[1/4] Downloading 3proxy..."
+echo "[1/4] Downloading 3proxy ${VERSION}..."
 cd "$SRC"
 wget -q https://github.com/3proxy/3proxy/archive/refs/tags/${VERSION}.tar.gz -O 3proxy.tar.gz
+
 rm -rf 3proxy-${VERSION}
 tar xzf 3proxy.tar.gz
 cd 3proxy-${VERSION}
 
 echo "[2/4] Building 3proxy..."
 make -f Makefile.Linux >/dev/null
+
+# NEW: correct binary path for version 0.9.6
 cp src/3proxy "$BIN"
 chmod +x "$BIN"
 
 echo "[3/4] Generating random credentials..."
-
 PORT=$(shuf -i 20000-60000 -n 1)
 USER=$(openssl rand -hex 4)
 PASS=$(openssl rand -hex 8)
@@ -74,7 +76,7 @@ systemctl daemon-reload
 systemctl enable 3proxy >/dev/null
 systemctl restart 3proxy
 
-echo "Fetching external IP..."
+# Fetch external IP
 IP=$(curl -s -H "Metadata-Flavor: Google" \
   http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
 
@@ -88,4 +90,4 @@ echo ""
 echo "$PROXY" > /root/proxy_info.txt
 echo "Saved to /root/proxy_info.txt"
 echo ""
-echo "⚠ IMPORTANT: Ensure your VPC firewall allows TCP port $PORT or a range like 20000-60000."
+echo "⚠ Make sure your VPC firewall allows TCP port $PORT"
