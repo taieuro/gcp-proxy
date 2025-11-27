@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Script chạy trong Cloud Shell để:
 # - Tạo nhiều VM GCP cho proxy
-# - Tạo firewall rule chung
+# - Tạo firewall rule chung cho proxy ports
 # - SSH tự động vào từng VM và chạy install.sh tạo proxy
 #
-# Cách chạy (sau khi đưa lên GitHub):
+# Cách chạy (sau khi file này ở trên GitHub):
 #   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
 
 set -euo pipefail
@@ -12,17 +12,22 @@ set -euo pipefail
 #######################################
 # CẤU HÌNH CÓ THỂ SỬA
 #######################################
-NUM_VMS=3                        # Số lượng VM muốn tạo
+NUM_VMS=3                        # Số VM muốn tạo
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
-ZONE="asia-southeast1-b"         # Zone (sửa nếu bạn muốn)
-MACHINE_TYPE="e2-micro"          # Loại máy (đủ cho proxy nhẹ, rẻ)
-IMAGE_FAMILY="debian-12"         # OS
+ZONE="asia-southeast1-b"         # Zone
+MACHINE_TYPE="e2-micro"          # Loại máy
+IMAGE_FAMILY="debian-12"         # Hệ điều hành
 IMAGE_PROJECT="debian-cloud"
 DISK_SIZE="10GB"
-DISK_TYPE="pd-balanced"
+DISK_TYPE="pd-standard"          # New standard persistent disk (rẻ nhất)
 NETWORK="default"                # Tên VPC network
-TAGS="proxy-vm"                  # Network tag cho firewall & VM
-FIREWALL_NAME="gcp-proxy-ports"  # Tên firewall rule
+
+# Networking tags:
+# - proxy-vm: dùng cho firewall rule gcp-proxy-ports (tcp:20000-60000)
+# - http-server, https-server, lb-health-check: tương đương tick 3 checkbox trong UI
+TAGS="proxy-vm,http-server,https-server,lb-health-check"
+
+FIREWALL_NAME="gcp-proxy-ports"  # Tên firewall rule cho proxy port
 PROXY_INSTALL_URL="https://raw.githubusercontent.com/taieuro/gcp-proxy/main/install.sh"
 
 #######################################
@@ -41,9 +46,11 @@ echo "Zone          : $ZONE"
 echo "Số VM         : $NUM_VMS"
 echo "VM name prefix: $VM_NAME_PREFIX"
 echo "Machine type  : $MACHINE_TYPE"
+echo "Disk size     : $DISK_SIZE"
+echo "Disk type     : $DISK_TYPE (New standard persistent disk)"
 echo "Network       : $NETWORK"
 echo "Tags          : $TAGS"
-echo "Firewall rule : $FIREWALL_NAME (tcp:20000-60000, 0.0.0.0/0)"
+echo "Firewall rule : $FIREWALL_NAME (tcp:20000-60000, 0.0.0.0/0, target tag=proxy-vm)"
 echo "Proxy script  : $PROXY_INSTALL_URL"
 echo
 
@@ -65,7 +72,7 @@ else
     --action=ALLOW \
     --rules=tcp:20000-60000 \
     --source-ranges=0.0.0.0/0 \
-    --target-tags="$TAGS"
+    --target-tags="proxy-vm"
   echo "✅ Đã tạo firewall rule '$FIREWALL_NAME'."
 fi
 
@@ -98,6 +105,7 @@ for i in $(seq 1 "$NUM_VMS"); do
     --image-project="$IMAGE_PROJECT" \
     --boot-disk-size="$DISK_SIZE" \
     --boot-disk-type="$DISK_TYPE" \
+    --network="$NETWORK" \
     --tags="$TAGS"
 
   echo "✅ Đã tạo VM '$VM_NAME'."
@@ -115,8 +123,9 @@ for VM_NAME in "${VM_NAMES[@]}"; do
   echo "▶ VM: $VM_NAME"
   echo "---------------------------------------------"
 
-  # Gọi SSH & chạy script cài proxy trên VM
-  # install.sh được thiết kế idempotent: nếu đã có proxy_info.txt -> chỉ in lại proxy.
+  # install.sh được thiết kế idempotent:
+  # - Nếu lần đầu: cài 3proxy, tạo proxy, in ip:port:user:pass
+  # - Nếu đã có: chỉ restart service và in lại proxy
   if gcloud compute ssh "$VM_NAME" \
         --zone="$ZONE" \
         --project="$PROJECT" \
