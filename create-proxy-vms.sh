@@ -5,7 +5,7 @@
 # - SSH song song vào từng VM MỚI và chạy install.sh tạo proxy
 # - Luôn in:
 #     + List proxy mới tạo
-#     + (OPTION) Dashboard full tất cả proxy hiện có trong project
+#     + Dashboard full tất cả proxy hiện có trong project
 #
 # Cách chạy:
 #   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
@@ -47,42 +47,53 @@ scan_existing_proxies() {
   echo
   echo "=== ĐANG SCAN TẤT CẢ PROXY HIỆN CÓ (${VM_NAME_PREFIX}-N TRÊN MỌI REGION) ==="
 
-  # Lấy toàn bộ VM tên dạng proxy-vm-N trên toàn project
+  # Lấy toàn bộ VM trên project, rồi lọc bằng bash
   local ALL
   ALL="$(gcloud compute instances list \
           --project="$PROJECT" \
-          --filter="name ~ '^${VM_NAME_PREFIX}-[0-9]+$'" \
           --format="value(name,zone)" 2>/dev/null || true)"
 
   if [[ -z "$ALL" ]]; then
-    echo "⚠ Không tìm thấy VM nào với prefix '${VM_NAME_PREFIX}-N'."
+    echo "⚠ Không tìm thấy VM nào trong project."
     echo
     return
   fi
 
+  local COUNT=0
   echo
   echo "============= DASHBOARD TOÀN BỘ PROXY ĐANG CÓ ============="
 
-  # Duyệt từng VM: SSH vào đọc /root/proxy_info.txt (do install.sh đã tạo)
   while read -r NAME ZONE; do
     [[ -z "$NAME" ]] && continue
 
+    # Chỉ lấy những VM có tên đúng format proxy-vm-N
+    if [[ ! "$NAME" =~ ^${VM_NAME_PREFIX}-[0-9]+$ ]]; then
+      continue
+    fi
+
+    ((COUNT++))
+
+    # Đọc PROXY từ file trên VM (không coi thiếu file là lỗi)
     local PROXY_LINE
-    if PROXY_LINE="$(gcloud compute ssh "$NAME" \
-                       --zone="$ZONE" \
-                       --project="$PROJECT" \
-                       --quiet \
-                       --command="sudo head -n 1 /root/proxy_info.txt 2>/dev/null" \
-                       2>/dev/null)"; then
-      if [[ -n "$PROXY_LINE" ]]; then
-        echo "$NAME ($ZONE): $PROXY_LINE"
-      else
-        echo "$NAME ($ZONE): (không đọc được nội dung /root/proxy_info.txt)"
-      fi
+    PROXY_LINE="$(
+      gcloud compute ssh "$NAME" \
+        --zone="$ZONE" \
+        --project="$PROJECT" \
+        --quiet \
+        --command="sudo head -n 1 /root/proxy_info.txt 2>/dev/null || true" \
+        2>/dev/null || true
+    )"
+
+    if [[ -n "$PROXY_LINE" ]]; then
+      echo "$NAME ($ZONE): $PROXY_LINE"
     else
-      echo "$NAME ($ZONE): (SSH lỗi khi đọc /root/proxy_info.txt)"
+      echo "$NAME ($ZONE): (không đọc được /root/proxy_info.txt)"
     fi
   done <<< "$ALL"
+
+  if (( COUNT == 0 )); then
+    echo "⚠ Không tìm thấy VM nào có tên dạng '${VM_NAME_PREFIX}-N'."
+  fi
 
   echo "==========================================================="
   echo
