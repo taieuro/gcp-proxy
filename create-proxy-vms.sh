@@ -5,7 +5,7 @@
 # - SSH song song vào từng VM mới và chạy install.sh tạo proxy
 # - Cuối cùng in GOM LIST PROXY của các VM mới để dễ copy/paste
 #
-# Cách chạy (sau khi file này ở trên GitHub):
+# Cách chạy:
 #   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
 
 set -euo pipefail
@@ -16,7 +16,7 @@ set -euo pipefail
 NUM_VMS=3                        # Số VM MUỐN TẠO THÊM MỖI LẦN CHẠY
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
 
-REGION="asia-northeast2"         # Region (1=Tokyo 2=osaka 3=seoul)
+REGION="asia-northeast2"         # Region
 ZONE=""                          # ĐỂ TRỐNG -> script tự chọn 1 zone trong REGION
 
 MACHINE_TYPE="e2-micro"          # Loại máy
@@ -112,7 +112,6 @@ MAX_INDEX=0
 if [[ -n "$EXISTING_NAMES" ]]; then
   while IFS= read -r NAME; do
     [[ -z "$NAME" ]] && continue
-    # Lấy phần số sau cùng sau dấu '-'
     IDX="${NAME##*-}"
     if [[ "$IDX" =~ ^[0-9]+$ ]]; then
       if (( IDX > MAX_INDEX )); then
@@ -152,6 +151,11 @@ gcloud compute instances create "${NEW_VM_NAMES[@]}" \
   --tags="$TAGS"
 
 echo "✅ Đã tạo xong các VM mới."
+echo
+
+# ĐỢI VM KHỞI ĐỘNG SSH
+echo "⏳ Đợi 30 giây để các VM mới khởi động dịch vụ SSH..."
+sleep 30
 echo
 
 #######################################
@@ -199,11 +203,17 @@ for VM_NAME in "${NEW_VM_NAMES[@]}"; do
       echo "✅ VM '$VM_NAME' cài proxy thành công."
     else
       FAILED_VMS+=("$VM_NAME")
-      echo "⚠ VM '$VM_NAME' không tìm thấy dòng PROXY trong log. Kiểm tra: $LOG_FILE"
+      echo "⚠ VM '$VM_NAME' KHÔNG tìm thấy dòng PROXY trong log. Kiểm tra: $LOG_FILE"
+      echo "---- Tail log $VM_NAME ----"
+      tail -n 20 "$LOG_FILE" || true
+      echo "----------------------------"
     fi
   else
     FAILED_VMS+=("$VM_NAME")
     echo "⚠ VM '$VM_NAME' cài proxy lỗi. Kiểm tra: $LOG_FILE"
+    echo "---- Tail log $VM_NAME ----"
+    tail -n 20 "$LOG_FILE" || true
+    echo "----------------------------"
   fi
 done
 
