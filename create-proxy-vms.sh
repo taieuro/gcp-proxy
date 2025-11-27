@@ -47,56 +47,55 @@ scan_existing_proxies() {
   echo
   echo "=== ĐANG SCAN TẤT CẢ PROXY HIỆN CÓ (${VM_NAME_PREFIX}-N TRÊN MỌI REGION) ==="
 
-  # Lấy toàn bộ VM trên project, rồi lọc bằng bash
-  local ALL
-  ALL="$(gcloud compute instances list \
-          --project="$PROJECT" \
-          --format="value(name,zone)" 2>/dev/null || true)"
-
-  if [[ -z "$ALL" ]]; then
-    echo "⚠ Không tìm thấy VM nào trong project."
-    echo
-    return
-  fi
+  # Tạm tắt -e để nếu một lệnh con lỗi thì vẫn scan tiếp
+  set +e
 
   local COUNT=0
-  echo
-  echo "============= DASHBOARD TOÀN BỘ PROXY ĐANG CÓ ============="
 
-  while read -r NAME ZONE; do
-    [[ -z "$NAME" ]] && continue
+  # Lấy toàn bộ VM trên project rồi lọc bằng bash
+  gcloud compute instances list \
+    --project="$PROJECT" \
+    --format="value(name,zone)" 2>/dev/null \
+  | while read -r NAME ZONE; do
+      [[ -z "$NAME" ]] && continue
 
-    # Chỉ lấy những VM có tên đúng format proxy-vm-N
-    if [[ ! "$NAME" =~ ^${VM_NAME_PREFIX}-[0-9]+$ ]]; then
-      continue
-    fi
+      # Chỉ lấy những VM có tên đúng format proxy-vm-N
+      if [[ ! "$NAME" =~ ^${VM_NAME_PREFIX}-[0-9]+$ ]]; then
+        continue
+      fi
 
-    ((COUNT++))
+      if [[ $COUNT -eq 0 ]]; then
+        echo
+        echo "============= DASHBOARD TOÀN BỘ PROXY ĐANG CÓ ============="
+      fi
+      COUNT=$((COUNT+1))
 
-    # Đọc PROXY từ file trên VM (không coi thiếu file là lỗi)
-    local PROXY_LINE
-    PROXY_LINE="$(
-      gcloud compute ssh "$NAME" \
-        --zone="$ZONE" \
-        --project="$PROJECT" \
-        --quiet \
-        --command="sudo head -n 1 /root/proxy_info.txt 2>/dev/null || true" \
-        2>/dev/null || true
-    )"
+      # Đọc PROXY từ file trên VM (không coi thiếu file là lỗi)
+      PROXY_LINE="$(
+        gcloud compute ssh "$NAME" \
+          --zone="$ZONE" \
+          --project="$PROJECT" \
+          --quiet \
+          --command="sudo head -n 1 /root/proxy_info.txt 2>/dev/null || true" \
+          2>/dev/null || true
+      )"
 
-    if [[ -n "$PROXY_LINE" ]]; then
-      echo "$NAME ($ZONE): $PROXY_LINE"
-    else
-      echo "$NAME ($ZONE): (không đọc được /root/proxy_info.txt)"
-    fi
-  done <<< "$ALL"
+      if [[ -n "$PROXY_LINE" ]]; then
+        echo "$NAME ($ZONE): $PROXY_LINE"
+      else
+        echo "$NAME ($ZONE): (không đọc được /root/proxy_info.txt)"
+      fi
+    done
 
-  if (( COUNT == 0 )); then
+  if [[ $COUNT -eq 0 ]]; then
     echo "⚠ Không tìm thấy VM nào có tên dạng '${VM_NAME_PREFIX}-N'."
+  else
+    echo "==========================================================="
   fi
-
-  echo "==========================================================="
   echo
+
+  # Bật lại -e
+  set -e
 }
 
 #######################################
@@ -229,7 +228,7 @@ if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
     echo "❗ Phát hiện lỗi quota IN_USE_ADDRESSES (hết số lượng IP external trong region $REGION)."
     echo "   Không tạo thêm được VM mới."
     rm -f "$TMP_ERR"
-    # Dù có option hay không, trường hợp quota hết vẫn scan cho bạn xem
+    # Trường hợp quota hết: luôn scan để bạn xem dashboard
     scan_existing_proxies
     exit 0
   fi
