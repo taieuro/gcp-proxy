@@ -124,6 +124,10 @@ echo "==============================================="
 echo
 echo "$PROXY" > "$INFO_FILE"
 echo "Saved to $INFO_FILE"
+
+# 👉 Thêm dòng này (rất quan trọng để script Cloud Shell đọc lại)
+echo "PROXY: $PROXY"
+
 echo
 echo "TIP:"
 echo "- Next time, just run the same command again to show this proxy:"
