@@ -12,10 +12,11 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-apt-get update -y >/dev/null
-apt-get install -y build-essential curl wget openssl >/dev/null
+apt-get update -y
+apt-get install -y build-essential curl wget openssl
 
-VERSION="0.9.6"
+# Dùng phiên bản CÓ THẬT: 0.9.5
+VERSION="0.9.5"
 SRC="/usr/local/src"
 CONF="/usr/local/etc/3proxy"
 LOG="/var/log/3proxy"
@@ -25,14 +26,14 @@ mkdir -p "$SRC" "$CONF" "$LOG"
 
 echo "[1/4] Downloading 3proxy ${VERSION}..."
 cd "$SRC"
-wget -q "https://github.com/3proxy/3proxy/archive/refs/tags/${VERSION}.tar.gz" -O 3proxy.tar.gz
+wget "https://github.com/3proxy/3proxy/archive/refs/tags/${VERSION}.tar.gz" -O 3proxy.tar.gz
 
 rm -rf "3proxy-${VERSION}"
 tar xzf 3proxy.tar.gz
 cd "3proxy-${VERSION}"
 
 echo "[2/4] Building 3proxy..."
-make -f Makefile.Linux >/dev/null
+make -f Makefile.Linux
 
 cp src/3proxy "$BIN"
 chmod +x "$BIN"
