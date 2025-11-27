@@ -25,16 +25,15 @@ mkdir -p "$SRC" "$CONF" "$LOG"
 
 echo "[1/4] Downloading 3proxy ${VERSION}..."
 cd "$SRC"
-wget -q https://github.com/3proxy/3proxy/archive/refs/tags/${VERSION}.tar.gz -O 3proxy.tar.gz
+wget -q "https://github.com/3proxy/3proxy/archive/refs/tags/${VERSION}.tar.gz" -O 3proxy.tar.gz
 
-rm -rf 3proxy-${VERSION}
+rm -rf "3proxy-${VERSION}"
 tar xzf 3proxy.tar.gz
-cd 3proxy-${VERSION}
+cd "3proxy-${VERSION}"
 
 echo "[2/4] Building 3proxy..."
 make -f Makefile.Linux >/dev/null
 
-# NEW: correct binary path for version 0.9.6
 cp src/3proxy "$BIN"
 chmod +x "$BIN"
 
@@ -47,7 +46,7 @@ echo "  Port: $PORT"
 echo "  User: $USER"
 echo "  Pass: $PASS"
 
-cat > $CONF/3proxy.cfg <<EOF
+cat > "$CONF/3proxy.cfg" <<EOF
 daemon
 nserver 8.8.8.8
 nserver 1.1.1.1
