@@ -3,6 +3,7 @@
 # - Lần đầu: cài 3proxy, tạo user/pass/port, systemd service
 # - Các lần sau: nhận diện proxy cũ, restart service, in lại proxy
 # Output: ip:port:user:pass + dòng "PROXY: ip:port:user:pass"
+# curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/install.sh | sudo bash
 
 set -e
 
