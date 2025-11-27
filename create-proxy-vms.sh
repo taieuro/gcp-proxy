@@ -2,9 +2,9 @@
 # Script chạy trong Cloud Shell để:
 # - Tạo nhiều VM GCP cho proxy
 # - Tạo firewall rule chung cho proxy ports
-# - SSH tự động vào từng VM và chạy install.sh tạo proxy
+# - SSH song song vào từng VM và chạy install.sh tạo proxy
 #
-# Cách chạy (sau khi file này ở trên GitHub):
+# Cách chạy:
 #   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
 
 set -euo pipefail
@@ -15,18 +15,18 @@ set -euo pipefail
 NUM_VMS=3                        # Số VM muốn tạo
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
 
-REGION="asia-northeast1"         # Region (1=Tokyo; 2=Osaka; 3=Seoul)
+REGION="asia-northeast1"         # Region (Tokyo)
 ZONE=""                          # ĐỂ TRỐNG -> script tự chọn 1 zone trong REGION
 
 MACHINE_TYPE="e2-micro"          # Loại máy
 IMAGE_FAMILY="debian-12"         # Hệ điều hành
 IMAGE_PROJECT="debian-cloud"
 DISK_SIZE="10GB"
-DISK_TYPE="pd-standard"          # New standard persistent disk
+DISK_TYPE="pd-standard"          # New standard persistent disk (rẻ nhất)
 
 NETWORK="default"                # Tên VPC network
 
-# Networking tags:
+# Networking tags (giống UI):
 # - proxy-vm: dùng cho firewall rule gcp-proxy-ports (tcp:20000-60000)
 # - http-server, https-server, lb-health-check: tương đương tick 3 checkbox trong UI
 TAGS="proxy-vm,http-server,https-server,lb-health-check"
@@ -96,11 +96,12 @@ fi
 echo
 
 #######################################
-# BƯỚC 2: TẠO CÁC VM
+# BƯỚC 2: TẠO CÁC VM (1 LỆNH DUY NHẤT)
 #######################################
 echo "=== Bước 2: Tạo các VM (nếu chưa tồn tại) ==="
 
 VM_NAMES=()
+NEW_VM_NAMES=()
 
 for i in $(seq 1 "$NUM_VMS"); do
   VM_NAME="${VM_NAME_PREFIX}-${i}"
@@ -110,11 +111,14 @@ for i in $(seq 1 "$NUM_VMS"); do
       --zone="$ZONE" \
       --project="$PROJECT" >/dev/null 2>&1; then
     echo "⚠ VM '$VM_NAME' đã tồn tại, bỏ qua tạo mới."
-    continue
+  else
+    NEW_VM_NAMES+=("$VM_NAME")
   fi
+done
 
-  echo "⏳ Đang tạo VM '$VM_NAME' ..."
-  gcloud compute instances create "$VM_NAME" \
+if [[ "${#NEW_VM_NAMES[@]}" -gt 0 ]]; then
+  echo "⏳ Đang tạo các VM mới: ${NEW_VM_NAMES[*]} ..."
+  gcloud compute instances create "${NEW_VM_NAMES[@]}" \
     --project="$PROJECT" \
     --zone="$ZONE" \
     --machine-type="$MACHINE_TYPE" \
@@ -124,36 +128,84 @@ for i in $(seq 1 "$NUM_VMS"); do
     --boot-disk-type="$DISK_TYPE" \
     --network="$NETWORK" \
     --tags="$TAGS"
-
-  echo "✅ Đã tạo VM '$VM_NAME'."
-done
+  echo "✅ Đã tạo xong các VM mới."
+else
+  echo "✅ Không có VM mới cần tạo."
+fi
 
 echo
+
 #######################################
-# BƯỚC 3: SSH TỰ ĐỘNG VÀO TỪNG VM, CHẠY install.sh
+# BƯỚC 3: SSH SONG SONG VÀO TỪNG VM, CHẠY install.sh
 #######################################
-echo "=== Bước 3: Cài proxy trên từng VM (tự động SSH + curl | sudo bash) ==="
+echo "=== Bước 3: Cài proxy trên từng VM (SSH song song) ==="
 echo
+
+declare -A LOG_FILES
+declare -A PIDS
 
 for VM_NAME in "${VM_NAMES[@]}"; do
-  echo "---------------------------------------------"
-  echo "▶ VM: $VM_NAME"
-  echo "---------------------------------------------"
+  LOG_FILE="/tmp/${VM_NAME}.proxy.log"
+  LOG_FILES["$VM_NAME"]="$LOG_FILE"
 
-  if gcloud compute ssh "$VM_NAME" \
+  echo "▶ Bắt đầu cài proxy trên VM '$VM_NAME' (log: $LOG_FILE)..."
+
+  # Chạy install.sh trên VM, toàn bộ output ghi vào file log trong Cloud Shell
+  gcloud compute ssh "$VM_NAME" \
         --zone="$ZONE" \
         --project="$PROJECT" \
         --quiet \
-        --command="curl -s $PROXY_INSTALL_URL | sudo bash"; then
-    echo "✅ Hoàn tất cài proxy trên VM '$VM_NAME'."
-  else
-    echo "⚠ Lỗi khi SSH/chạy script trên VM '$VM_NAME'."
-    echo "  Bạn có thể thử lại thủ công bằng:"
-    echo "    gcloud compute ssh $VM_NAME --zone=$ZONE --project=$PROJECT"
-    echo "    curl -s $PROXY_INSTALL_URL | sudo bash"
-  fi
+        --command="curl -s $PROXY_INSTALL_URL | sudo bash" \
+        >"$LOG_FILE" 2>&1 &
 
-  echo
+  PIDS["$VM_NAME"]=$!
 done
 
-echo "=== Tất cả bước đã hoàn tất. Xem log phía trên để biết proxy từng VM (ip:port:user:pass). ==="
+echo
+echo "⏳ Đang đợi các VM cài proxy xong..."
+echo
+
+declare -A PROXIES
+FAILED_VMS=()
+
+for VM_NAME in "${VM_NAMES[@]}"; do
+  PID="${PIDS[$VM_NAME]}"
+  LOG_FILE="${LOG_FILES[$VM_NAME]}"
+
+  if wait "$PID"; then
+    # Tìm dòng PROXY: ... trong log
+    if grep -q "PROXY:" "$LOG_FILE"; then
+      PROXY_LINE=$(grep "PROXY:" "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')
+      PROXIES["$VM_NAME"]="$PROXY_LINE"
+      echo "✅ VM '$VM_NAME' cài proxy thành công."
+    else
+      FAILED_VMS+=("$VM_NAME")
+      echo "⚠ VM '$VM_NAME' không tìm thấy dòng PROXY trong log. Kiểm tra: $LOG_FILE"
+    fi
+  else
+    FAILED_VMS+=("$VM_NAME")
+    echo "⚠ VM '$VM_NAME' cài proxy lỗi. Kiểm tra: $LOG_FILE"
+  fi
+done
+
+echo
+echo "================= TỔNG HỢP PROXY ĐÃ TẠO ================="
+for VM_NAME in "${VM_NAMES[@]}"; do
+  if [[ -n "${PROXIES[$VM_NAME]:-}" ]]; then
+    echo "$VM_NAME: ${PROXIES[$VM_NAME]}"
+  else
+    echo "$VM_NAME: (FAILED - xem log: ${LOG_FILES[$VM_NAME]})"
+  fi
+done
+echo "========================================================="
+echo
+
+if [[ "${#FAILED_VMS[@]}" -gt 0 ]]; then
+  echo "Một số VM bị lỗi: ${FAILED_VMS[*]}"
+  echo "Bạn có thể SSH vào và chạy lại thủ công, ví dụ:"
+  echo "  gcloud compute ssh ${FAILED_VMS[0]} --zone=$ZONE --project=$PROJECT"
+  echo "  curl -s $PROXY_INSTALL_URL | sudo bash"
+  echo
+fi
+
+echo "Hoàn tất."
