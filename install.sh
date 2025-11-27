@@ -49,7 +49,6 @@ echo "  User: $USER"
 echo "  Pass: $PASS"
 
 cat > "$CONF/3proxy.cfg" <<EOF
-daemon
 nserver 8.8.8.8
 nserver 1.1.1.1
 auth strong
