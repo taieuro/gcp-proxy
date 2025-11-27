@@ -14,12 +14,16 @@ set -euo pipefail
 #######################################
 NUM_VMS=3                        # Số VM muốn tạo
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
-ZONE="asia-northeast1"           # northeast1=Tokyo northeast2=Osaka northeast3=Seoul a/b/c=cụm máy
+
+REGION="asia-northeast1"         # Region (1=Tokyo; 2=Osaka; 3=Seoul)
+ZONE=""                          # ĐỂ TRỐNG -> script tự chọn 1 zone trong REGION
+
 MACHINE_TYPE="e2-micro"          # Loại máy
 IMAGE_FAMILY="debian-12"         # Hệ điều hành
 IMAGE_PROJECT="debian-cloud"
 DISK_SIZE="10GB"
-DISK_TYPE="pd-standard"          # New standard persistent disk (rẻ nhất)
+DISK_TYPE="pd-standard"          # New standard persistent disk
+
 NETWORK="default"                # Tên VPC network
 
 # Networking tags:
@@ -40,8 +44,21 @@ if [[ -z "$PROJECT" ]]; then
   exit 1
 fi
 
+# Nếu ZONE trống, tự chọn 1 zone trong REGION
+if [[ -z "${ZONE}" ]]; then
+  echo "⏳ Đang tự chọn 1 zone trong region $REGION ..."
+  ZONE="$(gcloud compute zones list \
+            --filter="region:($REGION) AND status:UP" \
+            --format="value(name)" | head -n 1 || true)"
+  if [[ -z "$ZONE" ]]; then
+    echo "❌ Không tìm được zone nào trong region $REGION. Kiểm tra lại REGION/Zones."
+    exit 1
+  fi
+fi
+
 echo "=== Thông tin cấu hình ==="
 echo "Project       : $PROJECT"
+echo "Region        : $REGION"
 echo "Zone          : $ZONE"
 echo "Số VM         : $NUM_VMS"
 echo "VM name prefix: $VM_NAME_PREFIX"
@@ -123,9 +140,6 @@ for VM_NAME in "${VM_NAMES[@]}"; do
   echo "▶ VM: $VM_NAME"
   echo "---------------------------------------------"
 
-  # install.sh được thiết kế idempotent:
-  # - Nếu lần đầu: cài 3proxy, tạo proxy, in ip:port:user:pass
-  # - Nếu đã có: chỉ restart service và in lại proxy
   if gcloud compute ssh "$VM_NAME" \
         --zone="$ZONE" \
         --project="$PROJECT" \
