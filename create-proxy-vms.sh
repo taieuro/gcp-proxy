@@ -14,7 +14,7 @@ set -euo pipefail
 #######################################
 NUM_VMS=3                        # Số VM muốn tạo
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
-ZONE="asia-southeast1-b"         # Zone
+ZONE="asia-northeast1"           # northeast1=Tokyo northeast2=Osaka northeast3=Seoul a/b/c=cụm máy
 MACHINE_TYPE="e2-micro"          # Loại máy
 IMAGE_FAMILY="debian-12"         # Hệ điều hành
 IMAGE_PROJECT="debian-cloud"
