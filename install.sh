@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Auto-create HTTP proxy on Google Cloud VM using 3proxy
-# - First run: install 3proxy, create user/pass/port, systemd service, firewall rule
-# - Next runs: detect existing proxy, restart service, check firewall, print proxy
+# - First run: install 3proxy, create user/pass/port, systemd service
+# - Next runs: detect existing proxy, restart service, print proxy
 # Output format: ip:port:user:pass
 
 set -e
@@ -13,102 +13,13 @@ BIN="/usr/local/bin/3proxy"
 SRC="/usr/local/src"
 VERSION="0.9.5"
 
-FW_STATUS="unknown"
-FW_REASON=""
-
 # 0. Must run as root
 if [ "$EUID" -ne 0 ]; then
   echo "❌ Please run using: curl -s URL | sudo bash"
   exit 1
 fi
 
-# 1. Firewall helper functions
-check_or_create_firewall() {
-  echo
-  echo "=== Firewall: checking gcp-proxy-ports (tcp:20000-60000) ==="
-
-  if ! command -v gcloud >/dev/null 2>&1; then
-    FW_STATUS="skipped"
-    FW_REASON="gcloud_not_found"
-    echo "⚠ gcloud not found on this VM. Skipping auto firewall rule."
-    return
-  fi
-
-  METADATA_HEADER="Metadata-Flavor: Google"
-
-  PROJECT_ID=$(curl -s -H "$METADATA_HEADER" \
-    http://169.254.169.254/computeMetadata/v1/project/project-id || true)
-
-  NETWORK_URL=$(curl -s -H "$METADATA_HEADER" \
-    http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/network || true)
-
-  NETWORK=${NETWORK_URL##*/}
-
-  if [ -z "$PROJECT_ID" ] || [ -z "$NETWORK" ]; then
-    FW_STATUS="skipped"
-    FW_REASON="metadata_missing"
-    echo "⚠ Cannot detect project/network from metadata. Skipping auto firewall rule."
-    return
-  fi
-
-  echo "Project: $PROJECT_ID"
-  echo "Network: $NETWORK"
-
-  if gcloud compute firewall-rules describe gcp-proxy-ports \
-      --project="$PROJECT_ID" >/dev/null 2>&1; then
-    FW_STATUS="exists"
-    FW_REASON="rule_already_exists"
-    echo "✅ Firewall rule gcp-proxy-ports already exists. No changes."
-    return
-  fi
-
-  echo "Creating firewall rule gcp-proxy-ports (tcp:20000-60000 from 0.0.0.0/0)..."
-
-  if gcloud compute firewall-rules create gcp-proxy-ports \
-      --project="$PROJECT_ID" \
-      --network="$NETWORK" \
-      --allow=tcp:20000-60000 \
-      --direction=INGRESS \
-      --source-ranges=0.0.0.0/0 >/dev/null 2>&1; then
-    FW_STATUS="created"
-    FW_REASON="created_ok"
-    echo "✅ Firewall rule gcp-proxy-ports created successfully."
-  else
-    FW_STATUS="failed"
-    FW_REASON="create_failed"
-    echo "⚠ Failed to create firewall rule automatically."
-    echo "  Please create this rule manually in VPC firewall:"
-    echo "  - Name: gcp-proxy-ports"
-    echo "  - Network: $NETWORK"
-    echo "  - Direction: INGRESS"
-    echo "  - Source: 0.0.0.0/0"
-    echo "  - Allowed: tcp:20000-60000"
-  fi
-}
-
-print_firewall_summary() {
-  echo
-  echo "Firewall summary:"
-  case "$FW_STATUS" in
-    created)
-      echo "- gcp-proxy-ports: created successfully (tcp:20000-60000 from 0.0.0.0/0)"
-      ;;
-    exists)
-      echo "- gcp-proxy-ports: already existed, no changes made."
-      ;;
-    skipped)
-      echo "- gcp-proxy-ports: skipped (reason: $FW_REASON)."
-      ;;
-    failed)
-      echo "- gcp-proxy-ports: FAILED to create automatically (see messages above)."
-      ;;
-    *)
-      echo "- gcp-proxy-ports: unknown status."
-      ;;
-  esac
-}
-
-# 2. If proxy already exists -> fast path
+# 1. Nếu đã có proxy_info.txt -> chỉ restart service + in lại proxy
 if [ -f "$INFO_FILE" ]; then
   echo
   echo "=== Existing 3proxy configuration detected ==="
@@ -121,9 +32,6 @@ if [ -f "$INFO_FILE" ]; then
     echo "⚠ 3proxy.service not found, but proxy_info.txt exists."
   fi
 
-  check_or_create_firewall
-  print_firewall_summary
-
   echo
   echo "Your proxy:"
   cat "$INFO_FILE"
@@ -132,7 +40,7 @@ if [ -f "$INFO_FILE" ]; then
   exit 0
 fi
 
-# 3. First-time install
+# 2. Lần đầu: cài đặt & tạo proxy
 echo "=== 3proxy auto proxy installer (first-time setup) ==="
 
 apt-get update -y
@@ -140,10 +48,11 @@ apt-get install -y build-essential curl wget openssl
 
 mkdir -p "$SRC" "$CONF" "$LOG"
 
+# 2.1 Build 3proxy nếu chưa có
 if [ -x "$BIN" ]; then
-  echo "[1/4] 3proxy binary already exists at $BIN, skipping build."
+  echo "[1/3] 3proxy binary already exists at $BIN, skipping build."
 else
-  echo "[1/4] Downloading 3proxy ${VERSION}..."
+  echo "[1/3] Downloading 3proxy ${VERSION}..."
   cd "$SRC"
   wget -q "https://github.com/3proxy/3proxy/archive/refs/tags/${VERSION}.tar.gz" -O 3proxy.tar.gz
 
@@ -151,14 +60,15 @@ else
   tar xzf 3proxy.tar.gz
   cd "3proxy-${VERSION}"
 
-  echo "[2/4] Building 3proxy..."
+  echo "[2/3] Building 3proxy..."
   make -f Makefile.Linux
 
   cp bin/3proxy "$BIN"
   chmod +x "$BIN"
 fi
 
-echo "[3/4] Generating random credentials..."
+# 2.2 Tạo port / user / pass + config
+echo "[3/3] Generating random credentials..."
 PORT=$(shuf -i 20000-60000 -n 1)
 USER=$(openssl rand -hex 4)
 PASS=$(openssl rand -hex 8)
@@ -176,8 +86,7 @@ allow $USER
 proxy -n -a -p$PORT
 EOF
 
-echo "[4/4] Creating systemd service..."
-
+# 2.3 Tạo systemd service
 cat > /etc/systemd/system/3proxy.service <<EOF
 [Unit]
 Description=3proxy proxy
@@ -197,8 +106,7 @@ systemctl enable 3proxy >/dev/null
 systemctl reset-failed 3proxy >/dev/null 2>&1 || true
 systemctl restart 3proxy
 
-check_or_create_firewall
-
+# 2.4 Lấy IP public & in ra proxy + lưu lại
 METADATA_HEADER="Metadata-Flavor: Google"
 IP=$(curl -s -H "$METADATA_HEADER" \
   http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip || true)
@@ -216,11 +124,11 @@ echo "==============================================="
 echo
 echo "$PROXY" > "$INFO_FILE"
 echo "Saved to $INFO_FILE"
-
-print_firewall_summary
-
 echo
 echo "TIP:"
 echo "- Next time, just run the same command again to show this proxy:"
 echo "  curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/install.sh | sudo bash"
+echo
+echo "NOTE:"
+echo "- Make sure you have a VPC firewall rule allowing tcp:20000-60000 from 0.0.0.0/0 to this network."
 echo
