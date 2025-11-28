@@ -13,10 +13,10 @@ set -euo pipefail
 #######################################
 # CẤU HÌNH CÓ THỂ SỬA
 #######################################
-NUM_VMS=4                        # Số VM MUỐN TẠO THÊM MỖI LẦN CHẠY
+NUM_VMS=3                        # Số VM MUỐN TẠO THÊM MỖI LẦN CHẠY
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
 
-REGION="asia-northeast1"         # Region
+REGION="asia-northeast2"         # Region
 ZONE=""                          # ĐỂ TRỐNG -> script tự chọn 1 zone trong REGION
 
 MACHINE_TYPE="e2-micro"          # Loại máy
@@ -181,9 +181,30 @@ sleep 30
 echo
 
 #######################################
-# BƯỚC 3: SSH SONG SONG VÀO TỪNG VM MỚI, CHẠY install.sh
+# BƯỚC 3: CHUẨN BỊ SSH KEY CHO GCLOUD (TRÁNH LỖI OVERWRITE)
 #######################################
-echo "=== Bước 3: Cài proxy trên các VM mới (SSH song song) ==="
+echo "=== Bước 3: Kiểm tra/generate SSH key cho gcloud ==="
+
+SSH_KEY_PRIV="$HOME/.ssh/google_compute_engine"
+SSH_KEY_PUB="$HOME/.ssh/google_compute_engine.pub"
+
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+
+if [[ ! -f "$SSH_KEY_PRIV" || ! -f "$SSH_KEY_PUB" ]]; then
+  echo "⏳ Đang tạo SSH key $SSH_KEY_PRIV ..."
+  ssh-keygen -t rsa -f "$SSH_KEY_PRIV" -N "" -q
+  echo "✅ Đã tạo SSH key cho gcloud."
+else
+  echo "✅ SSH key đã tồn tại: $SSH_KEY_PRIV"
+fi
+
+echo
+
+#######################################
+# BƯỚC 4: SSH SONG SONG VÀO TỪNG VM MỚI, CHẠY install.sh
+#######################################
+echo "=== Bước 4: Cài proxy trên các VM mới (SSH song song) ==="
 echo
 
 declare -A LOG_FILES
