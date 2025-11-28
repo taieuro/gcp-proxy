@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Script chạy trong Cloud Shell để:
+# - Hỏi bạn muốn proxy ở đâu (1=Tokyo, 2=Osaka, 3=Seoul)
+# - Tự dò quota IN_USE_ADDRESSES trong region đó và đặt NUM_VMS = số VM tối đa có thể tạo thêm
 # - Mỗi lần chạy tạo THÊM NUM_VMS VM mới (tên tăng dần: proxy-vm-1,2,3...)
 # - Tạo firewall rule chung cho proxy ports (nếu chưa có)
 # - SSH song song vào từng VM MỚI và chạy install.sh tạo proxy
@@ -11,19 +13,19 @@
 set -euo pipefail
 
 #######################################
-# CẤU HÌNH CÓ THỂ SỬA
+# CẤU HÌNH CÓ THỂ SỬA NHẸ (nếu muốn)
 #######################################
-NUM_VMS=4                        # Số VM MUỐN TẠO THÊM MỖI LẦN CHẠY
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
 
-REGION="asia-northeast2"         # Region
-ZONE=""                          # ĐỂ TRỐNG -> script tự chọn 1 zone trong REGION
+# REGION & ZONE sẽ được chọn bằng menu, nên để trống
+REGION=""
+ZONE=""
 
 MACHINE_TYPE="e2-micro"          # Loại máy
 IMAGE_FAMILY="debian-12"         # Hệ điều hành
 IMAGE_PROJECT="debian-cloud"
 DISK_SIZE="10GB"
-DISK_TYPE="pd-standard"          # New standard persistent disk (rẻ nhất)
+DISK_TYPE="pd-standard"          # New standard persistent disk (New standard persistent disk)
 
 NETWORK="default"                # Tên VPC network
 
@@ -45,7 +47,101 @@ if [[ -z "$PROJECT" ]]; then
   exit 1
 fi
 
-# Nếu ZONE trống, tự chọn 1 zone trong REGION
+#######################################
+# BƯỚC 0: MENU CHỌN REGION (1/2/3)
+#######################################
+echo "=== Chọn location cho proxy ==="
+echo "  1) Tokyo, Japan  (asia-northeast1)"
+echo "  2) Osaka, Japan  (asia-northeast2)"
+echo "  3) Seoul, Korea  (asia-northeast3)"
+
+REGION_CHOICE=""
+if [[ -r /dev/tty ]]; then
+  printf "Nhập lựa chọn (1/2/3): " > /dev/tty
+  read -r REGION_CHOICE < /dev/tty
+else
+  read -rp "Nhập lựa chọn (1/2/3): " REGION_CHOICE
+fi
+
+REGION_LABEL=""
+case "$REGION_CHOICE" in
+  1)
+    REGION="asia-northeast1"
+    REGION_LABEL="Tokyo, Japan"
+    ;;
+  2)
+    REGION="asia-northeast2"
+    REGION_LABEL="Osaka, Japan"
+    ;;
+  3)
+    REGION="asia-northeast3"
+    REGION_LABEL="Seoul, Korea"
+    ;;
+  *)
+    echo "❌ Lựa chọn không hợp lệ. Vui lòng chạy lại và chọn 1, 2 hoặc 3."
+    exit 1
+    ;;
+esac
+
+echo
+echo "Bạn đã chọn: $REGION_LABEL ($REGION)"
+echo
+
+#######################################
+# BƯỚC 0.1: DÒ QUOTA IN_USE_ADDRESSES VÀ ĐẶT NUM_VMS
+#######################################
+echo "=== Bước 0: Kiểm tra quota IN_USE_ADDRESSES trong region $REGION ==="
+
+# Lấy limit & usage cho quota IN_USE_ADDRESSES
+QUOTA_LINE="$(gcloud compute regions describe "$REGION" \
+  --project="$PROJECT" \
+  --format='value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)' \
+  2>/dev/null || echo "")"
+
+if [[ -z "$QUOTA_LINE" ]]; then
+  echo "⚠ Không lấy được quota IN_USE_ADDRESSES (có thể do quyền hoặc format)."
+  echo "   Tạm dùng NUM_VMS = 1."
+  NUM_VMS=1
+else
+  # QUOTA_LINE dạng: "4.0 2.0"
+  read -r LIMIT USAGE <<< "$QUOTA_LINE"
+
+  # Bỏ phần thập phân nếu có (4.0 -> 4)
+  LIMIT_INT="${LIMIT%.*}"
+  USAGE_INT="${USAGE%.*}"
+
+  # Nếu vẫn rỗng thì fallback
+  if [[ -z "$LIMIT_INT" || -z "$USAGE_INT" ]]; then
+    echo "⚠ Không parse được quota IN_USE_ADDRESSES (LIMIT=$LIMIT, USAGE=$USAGE)."
+    echo "   Tạm dùng NUM_VMS = 1."
+    NUM_VMS=1
+  else
+    if (( USAGE_INT >= LIMIT_INT )); then
+      echo "❗ Quota IN_USE_ADDRESSES trong region $REGION đã đầy."
+      echo "   Limit: $LIMIT_INT, đang dùng: $USAGE_INT, còn lại: 0."
+      echo "   Không thể tạo thêm VM với external IP trong region này."
+      exit 0
+    fi
+
+    REMAINING=$((LIMIT_INT - USAGE_INT))
+
+    echo "Quota IN_USE_ADDRESSES:"
+    echo "  - Limit : $LIMIT_INT"
+    echo "  - Đang dùng: $USAGE_INT"
+    echo "  - Còn lại : $REMAINING (external IP có thể dùng thêm)"
+
+    # ✔ Gán NUM_VMS = giá trị tối đa còn lại
+    NUM_VMS=$REMAINING
+
+    echo "=> Sẽ tạo NUM_VMS = $NUM_VMS VM mới trong lần chạy này."
+  fi
+fi
+
+echo
+
+#######################################
+# BƯỚC 0.2: TỰ CHỌN ZONE TRONG REGION
+#######################################
 if [[ -z "${ZONE}" ]]; then
   echo "⏳ Đang tự chọn 1 zone trong region $REGION ..."
   ZONE="$(gcloud compute zones list \
@@ -59,7 +155,7 @@ fi
 
 echo "=== Thông tin cấu hình ==="
 echo "Project       : $PROJECT"
-echo "Region        : $REGION"
+echo "Region        : $REGION ($REGION_LABEL)"
 echo "Zone          : $ZONE"
 echo "Số VM mới     : $NUM_VMS"
 echo "VM name prefix: $VM_NAME_PREFIX"
