@@ -13,10 +13,10 @@ set -euo pipefail
 #######################################
 # CẤU HÌNH CÓ THỂ SỬA
 #######################################
-NUM_VMS=3                        # Số VM MUỐN TẠO THÊM MỖI LẦN CHẠY
+NUM_VMS=4                        # Số VM MUỐN TẠO THÊM MỖI LẦN CHẠY
 VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
 
-REGION="asia-northeast2"         # Region
+REGION="asia-northeast1"         # Region
 ZONE=""                          # ĐỂ TRỐNG -> script tự chọn 1 zone trong REGION
 
 MACHINE_TYPE="e2-micro"          # Loại máy
