@@ -95,10 +95,10 @@ echo "=== Bước 0: Kiểm tra quota IN_USE_ADDRESSES trong region $REGION ==="
 NUM_VMS_DEFAULT=1
 NUM_VMS="$NUM_VMS_DEFAULT"
 
-QUOTA_LINE="$(gcloud compute regions describe "$REGION" \
+QUOTA_LINE=$( gcloud compute regions describe "$REGION" \
   --project="$PROJECT" \
   --format='value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)' \
-  2>/dev/null || true)"
+  2>/dev/null ) || QUOTA_LINE=""
 
 if [[ -z "$QUOTA_LINE" ]]; then
   echo "⚠ Không lấy được quota IN_USE_ADDRESSES (có thể do quyền hoặc format)."
