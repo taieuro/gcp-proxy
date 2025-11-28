@@ -44,14 +44,22 @@ fi
 #######################################
 # BƯỚC 0: MENU CHỌN REGION (1/2/3)
 #######################################
-cat <<'MENU'
+cat << 'MENU'
 === Chọn location cho proxy ===
   1) Tokyo, Japan  (asia-northeast1)
   2) Osaka, Japan  (asia-northeast2)
   3) Seoul, Korea  (asia-northeast3)
 MENU
 
-read -r -p "Nhập lựa chọn (1/2/3): " REGION_CHOICE
+REGION_CHOICE=""
+if [[ -r /dev/tty ]]; then
+  # Khi chạy curl | bash, stdin là script → ta đọc từ /dev/tty để lấy input từ user
+  printf "Nhập lựa chọn (1/2/3): " > /dev/tty
+  read -r REGION_CHOICE < /dev/tty
+else
+  # Trường hợp script chạy trực tiếp (bash create-proxy-vms.sh)
+  read -rp "Nhập lựa chọn (1/2/3): " REGION_CHOICE
+fi
 
 REGION_LABEL=""
 case "$REGION_CHOICE" in
@@ -73,7 +81,7 @@ case "$REGION_CHOICE" in
     ;;
 esac
 
-printf 'Bạn đã chọn: %s (%s)\n\n' "$REGION_LABEL" "$REGION"
+printf '\nBạn đã chọn: %s (%s)\n\n' "$REGION_LABEL" "$REGION"
 
 #######################################
 # BƯỚC 0.1: DÒ QUOTA IN_USE_ADDRESSES
