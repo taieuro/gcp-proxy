@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Script tạo Proxy V4 (Final Stable)
-# Fix lỗi: Thoát đột ngột ở Bước 0 do lỗi parsing dữ liệu.
-# Tính năng: Tự động tính Max Quota, bỏ qua xác thực SSH, chạy song song.
+# Script tạo Proxy V5 (Python Parser Edition)
+# Cập nhật: Dùng Python để đọc Quota chính xác 100%, khắc phục lỗi "Không đọc được Quota".
+# Cách chạy:
+#   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
 
 set -eo pipefail
 
@@ -20,9 +21,6 @@ NETWORK="default"
 TAGS="proxy-vm,http-server,https-server,lb-health-check"
 FIREWALL_NAME="gcp-proxy-ports"
 PROXY_INSTALL_URL="https://raw.githubusercontent.com/taieuro/gcp-proxy/main/install.sh"
-
-# Mặc định tạo 4 VM nếu không dò được Quota (Con số an toàn cho Free Tier)
-DEFAULT_NUM_VMS=4 
 
 #######################################
 # KIỂM TRA PROJECT
@@ -61,41 +59,60 @@ esac
 printf '\nBạn đã chọn: %s (%s)\n\n' "$REGION_LABEL" "$REGION"
 
 #######################################
-# BƯỚC 0.1: DÒ QUOTA (SAFE MODE)
+# BƯỚC 0.1: DÒ QUOTA (DÙNG PYTHON PARSER)
 #######################################
-echo "=== Bước 0: Tính toán số lượng VM tối đa (Quota Check) ==="
+echo "=== Bước 0: Tính toán Quota (Sử dụng Python Parser) ==="
 
 NUM_VMS=0
+LIMIT_VAL=""
+USAGE_VAL=""
 
-# Lấy trực tiếp Limit và Usage bằng filter của gcloud (tránh dùng grep gây lỗi script)
-# Thêm || true để dù lỗi cũng không làm crash script
-LIMIT_RAW="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="value(quotas[metric='IN_USE_ADDRESSES'].limit)" --quiet 2>/dev/null || true)"
-USAGE_RAW="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="value(quotas[metric='IN_USE_ADDRESSES'].usage)" --quiet 2>/dev/null || true)"
+# 1. Lấy dữ liệu dạng JSON (Chuẩn xác nhất)
+JSON_DATA=$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="json" --quiet 2>/dev/null || true)
 
-# Chuyển về số nguyên (loại bỏ .0 nếu có)
-LIMIT_INT="${LIMIT_RAW%.*}"
-USAGE_INT="${USAGE_RAW%.*}"
+# 2. Dùng Python để bóc tách dữ liệu (Chính xác tuyệt đối)
+if [[ -n "$JSON_DATA" ]]; then
+  read -r LIMIT_VAL USAGE_VAL <<< $(echo "$JSON_DATA" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    found = False
+    for q in data.get('quotas', []):
+        if q['metric'] == 'IN_USE_ADDRESSES':
+            print(f\"{q['limit']} {q['usage']}\")
+            found = True
+            break
+    if not found:
+        print(\"ERROR ERROR\")
+except:
+    print(\"ERROR ERROR\")
+")
+fi
 
-if [[ -n "$LIMIT_INT" && -n "$USAGE_INT" ]]; then
+# 3. Xử lý kết quả
+if [[ "$LIMIT_VAL" == "ERROR" || -z "$LIMIT_VAL" ]]; then
+    echo "⚠ Vẫn không đọc được Quota. Để an toàn, script sẽ chỉ tạo thêm 1 VM."
+    NUM_VMS=1
+else
+    # Loại bỏ phần thập phân (.0)
+    LIMIT_INT="${LIMIT_VAL%.*}"
+    USAGE_INT="${USAGE_VAL%.*}"
+    
     REMAINING=$((LIMIT_INT - USAGE_INT))
-    echo "📊 Thống kê Quota IP External:"
+    
+    echo "📊 Thống kê Quota IP từ Google:"
     echo "   - Giới hạn (Limit): $LIMIT_INT"
     echo "   - Đang dùng (Used): $USAGE_INT"
     echo "   - Còn dư (Free)   : $REMAINING"
     
     if (( REMAINING <= 0 )); then
-        echo "❗ Đã hết sạch Quota IP (0). Không thể tạo thêm VM."
+        echo "❗ Đã hết Quota (0). Không thể tạo thêm VM."
         exit 0
     fi
     NUM_VMS="$REMAINING"
-else
-    # Fallback: Nếu không lấy được quota, dùng mặc định
-    echo "⚠ Không đọc được Quota (do quyền hạn hoặc lỗi API)."
-    echo "👉 Chuyển sang chế độ mặc định: Sẽ tạo $DEFAULT_NUM_VMS VM."
-    NUM_VMS=$DEFAULT_NUM_VMS
 fi
 
-echo "=> Sẽ tiến hành tạo đồng loạt: $NUM_VMS VM."
+echo "=> Sẽ tiến hành tạo thêm: $NUM_VMS VM."
 echo
 
 #######################################
@@ -112,7 +129,7 @@ echo "Zone được chọn: $ZONE"
 #######################################
 echo "=== Bước 1: Kiểm tra Firewall Rule ==="
 if ! gcloud compute firewall-rules describe "$FIREWALL_NAME" --project="$PROJECT" --quiet >/dev/null 2>&1; then
-  echo "⏳ Đang tạo firewall rule '$FIREWALL_NAME'..."
+  echo "⏳ Đang tạo firewall rule..."
   gcloud compute firewall-rules create "$FIREWALL_NAME" \
     --project="$PROJECT" --network="$NETWORK" --direction=INGRESS --priority=1000 \
     --action=ALLOW --rules=tcp:20000-60000 --source-ranges=0.0.0.0/0 --target-tags="proxy-vm" --quiet
@@ -151,8 +168,7 @@ if [[ "${#NEW_VM_NAMES[@]}" -eq 0 ]]; then
   exit 0
 fi
 
-echo "⏳ Đang gửi lệnh tạo ${#NEW_VM_NAMES[@]} VM cùng lúc: ${NEW_VM_NAMES[*]} ..."
-echo "   (Quá trình này có thể mất 1-2 phút, vui lòng đợi)"
+echo "⏳ Đang gửi lệnh tạo ${#NEW_VM_NAMES[@]} VM: ${NEW_VM_NAMES[*]} ..."
 
 TMP_ERR="$(mktemp)"
 if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
@@ -164,10 +180,9 @@ if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
   cat "$TMP_ERR"
   if grep -q "IN_USE_ADDRESSES" "$TMP_ERR"; then
     echo
-    echo "❗ Lỗi Quota từ Google Cloud (Hết IP)!"
-    echo "   Các VM đã kịp tạo trước khi lỗi vẫn sẽ hoạt động."
+    echo "❗ Lỗi Quota! (Tuy nhiên các VM đã tạo thành công trước đó vẫn dùng được)"
   else
-    echo "❌ Có lỗi xảy ra khi tạo VM (nhưng không dừng script, sẽ thử cài proxy cho các VM đã tạo được)."
+    echo "❌ Lỗi tạo VM."
   fi
   rm -f "$TMP_ERR"
 else
@@ -176,7 +191,7 @@ else
 fi
 
 echo
-echo "⏳ Đợi 40 giây cho các VM khởi động dịch vụ..."
+echo "⏳ Đợi 40 giây cho các VM khởi động..."
 sleep 40 
 echo
 
@@ -193,7 +208,7 @@ else
 fi
 
 #######################################
-# BƯỚC 4: CÀI PROXY (SSH FIX)
+# BƯỚC 4: CÀI PROXY
 #######################################
 echo "=== Bước 4: Cài đặt Proxy song song ==="
 declare -A LOG_FILES
@@ -202,7 +217,6 @@ declare -A PIDS
 # Lọc lại danh sách VM thực tế đang chạy
 ACTUAL_RUNNING_VMS=()
 for NAME in "${NEW_VM_NAMES[@]}"; do
-  # Kiểm tra nhanh xem VM có tồn tại và đang chạy không
   STATUS=$(gcloud compute instances describe "$NAME" --zone="$ZONE" --format="value(status)" --quiet 2>/dev/null || true)
   if [[ "$STATUS" == "RUNNING" ]]; then
     ACTUAL_RUNNING_VMS+=("$NAME")
@@ -210,20 +224,17 @@ for NAME in "${NEW_VM_NAMES[@]}"; do
 done
 
 if [[ "${#ACTUAL_RUNNING_VMS[@]}" -eq 0 ]]; then
-    echo "❌ Không có VM nào ở trạng thái RUNNING để cài đặt."
-    echo "   (Có thể do lỗi Quota nên không VM nào được tạo thành công)"
+    echo "❌ Không có VM nào chạy để cài đặt."
     exit 0
 fi
 
 for NAME in "${ACTUAL_RUNNING_VMS[@]}"; do
   LOG_FILE="/tmp/${NAME}.proxy.log"
   LOG_FILES["$NAME"]="$LOG_FILE"
-  echo "▶ Đang cài trên $NAME (log: $LOG_FILE)..."
+  echo "▶ Đang cài trên $NAME..."
 
   gcloud compute ssh "$NAME" \
-    --zone="$ZONE" \
-    --project="$PROJECT" \
-    --quiet \
+    --zone="$ZONE" --project="$PROJECT" --quiet \
     --ssh-flag="-o StrictHostKeyChecking=no" \
     --ssh-flag="-o UserKnownHostsFile=/dev/null" \
     --command="curl -s $PROXY_INSTALL_URL | sudo bash" \
@@ -233,7 +244,7 @@ for NAME in "${ACTUAL_RUNNING_VMS[@]}"; do
 done
 
 echo
-echo "⏳ Đang chạy script cài đặt trên ${#ACTUAL_RUNNING_VMS[@]} VM..."
+echo "⏳ Đang cài đặt..."
 declare -A PROXIES
 FAILED_VMS=()
 
