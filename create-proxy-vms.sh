@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Script tạo Proxy V3 (Max Speed & Max Quota)
-# Tính năng: Tự động tính toán số lượng VM tối đa còn lại và tạo hết trong 1 lần chạy.
-# Cách chạy:
-#   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
+# Script tạo Proxy V4 (Final Stable)
+# Fix lỗi: Thoát đột ngột ở Bước 0 do lỗi parsing dữ liệu.
+# Tính năng: Tự động tính Max Quota, bỏ qua xác thực SSH, chạy song song.
 
 set -eo pipefail
 
@@ -22,13 +21,15 @@ TAGS="proxy-vm,http-server,https-server,lb-health-check"
 FIREWALL_NAME="gcp-proxy-ports"
 PROXY_INSTALL_URL="https://raw.githubusercontent.com/taieuro/gcp-proxy/main/install.sh"
 
+# Mặc định tạo 4 VM nếu không dò được Quota (Con số an toàn cho Free Tier)
+DEFAULT_NUM_VMS=4 
+
 #######################################
 # KIỂM TRA PROJECT
 #######################################
 PROJECT="$(gcloud config get-value project 2>/dev/null || echo)"
 if [[ -z "$PROJECT" ]]; then
-  echo "❌ Không lấy được project hiện tại."
-  echo "   Hãy chạy: gcloud config set project <PROJECT_ID>"
+  echo "❌ Không lấy được project hiện tại. Hãy chạy: gcloud config set project <ID>"
   exit 1
 fi
 
@@ -60,37 +61,26 @@ esac
 printf '\nBạn đã chọn: %s (%s)\n\n' "$REGION_LABEL" "$REGION"
 
 #######################################
-# BƯỚC 0.1: DÒ QUOTA (LOGIC MỚI - CHÍNH XÁC HƠN)
+# BƯỚC 0.1: DÒ QUOTA (SAFE MODE)
 #######################################
 echo "=== Bước 0: Tính toán số lượng VM tối đa (Quota Check) ==="
 
-# Lấy danh sách quota dưới dạng text dễ xử lý hơn json
-QUOTA_RAW="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="value(quotas)" --quiet || true)"
-
-# Dùng grep và awk để tìm dòng IN_USE_ADDRESSES và lấy 2 số Limit, Usage
-# Định dạng output thường là: ...; metric=IN_USE_ADDRESSES; limit=8.0; usage=0.0; ...
-LIMIT_VAL=$(echo "$QUOTA_RAW" | grep -o "metric=IN_USE_ADDRESSES; limit=[0-9.]*; usage=[0-9.]*" | grep -o "limit=[0-9.]*" | cut -d= -f2 | cut -d. -f1)
-USAGE_VAL=$(echo "$QUOTA_RAW" | grep -o "metric=IN_USE_ADDRESSES; limit=[0-9.]*; usage=[0-9.]*" | grep -o "usage=[0-9.]*" | cut -d= -f2 | cut -d. -f1)
-
-# Nếu không tìm thấy bằng grep (do format khác), thử phương án dự phòng gcloud filter
-if [[ -z "$LIMIT_VAL" ]]; then
-    echo "⚠ Phương án 1 không lấy được quota, thử phương án 2..."
-    QUOTA_V2="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="value(quotas.limit,quotas.usage)" --filter="quotas.metric=IN_USE_ADDRESSES" --quiet || true)"
-    if [[ -n "$QUOTA_V2" ]]; then
-        read -r LIMIT_VAL USAGE_VAL <<< "$QUOTA_V2"
-        # Xóa phần thập phân nếu có
-        LIMIT_VAL="${LIMIT_VAL%.*}"
-        USAGE_VAL="${USAGE_VAL%.*}"
-    fi
-fi
-
 NUM_VMS=0
 
-if [[ -n "$LIMIT_VAL" && -n "$USAGE_VAL" ]]; then
-    REMAINING=$((LIMIT_VAL - USAGE_VAL))
+# Lấy trực tiếp Limit và Usage bằng filter của gcloud (tránh dùng grep gây lỗi script)
+# Thêm || true để dù lỗi cũng không làm crash script
+LIMIT_RAW="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="value(quotas[metric='IN_USE_ADDRESSES'].limit)" --quiet 2>/dev/null || true)"
+USAGE_RAW="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="value(quotas[metric='IN_USE_ADDRESSES'].usage)" --quiet 2>/dev/null || true)"
+
+# Chuyển về số nguyên (loại bỏ .0 nếu có)
+LIMIT_INT="${LIMIT_RAW%.*}"
+USAGE_INT="${USAGE_RAW%.*}"
+
+if [[ -n "$LIMIT_INT" && -n "$USAGE_INT" ]]; then
+    REMAINING=$((LIMIT_INT - USAGE_INT))
     echo "📊 Thống kê Quota IP External:"
-    echo "   - Giới hạn (Limit): $LIMIT_VAL"
-    echo "   - Đang dùng (Used): $USAGE_VAL"
+    echo "   - Giới hạn (Limit): $LIMIT_INT"
+    echo "   - Đang dùng (Used): $USAGE_INT"
     echo "   - Còn dư (Free)   : $REMAINING"
     
     if (( REMAINING <= 0 )); then
@@ -99,9 +89,10 @@ if [[ -n "$LIMIT_VAL" && -n "$USAGE_VAL" ]]; then
     fi
     NUM_VMS="$REMAINING"
 else
-    # Fallback nếu mọi cách đều thất bại
-    echo "⚠ Không dò được Quota chính xác. Hệ thống sẽ cố gắng tạo 4 VM (mức an toàn)."
-    NUM_VMS=4
+    # Fallback: Nếu không lấy được quota, dùng mặc định
+    echo "⚠ Không đọc được Quota (do quyền hạn hoặc lỗi API)."
+    echo "👉 Chuyển sang chế độ mặc định: Sẽ tạo $DEFAULT_NUM_VMS VM."
+    NUM_VMS=$DEFAULT_NUM_VMS
 fi
 
 echo "=> Sẽ tiến hành tạo đồng loạt: $NUM_VMS VM."
@@ -173,17 +164,15 @@ if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
   cat "$TMP_ERR"
   if grep -q "IN_USE_ADDRESSES" "$TMP_ERR"; then
     echo
-    echo "❗ Lỗi Quota từ Google Cloud!"
-    echo "   Google báo bạn đã vượt quá giới hạn IP cho phép."
-    echo "   Tuy nhiên, các VM đã được tạo trước khi gặp lỗi vẫn sẽ hoạt động."
+    echo "❗ Lỗi Quota từ Google Cloud (Hết IP)!"
+    echo "   Các VM đã kịp tạo trước khi lỗi vẫn sẽ hoạt động."
   else
-    echo "❌ Có lỗi xảy ra khi tạo VM."
+    echo "❌ Có lỗi xảy ra khi tạo VM (nhưng không dừng script, sẽ thử cài proxy cho các VM đã tạo được)."
   fi
   rm -f "$TMP_ERR"
-  # Không exit ở đây, cố gắng cài proxy cho những con đã tạo được (nếu có)
 else
   rm -f "$TMP_ERR"
-  echo "✅ Đã tạo xong tất cả các VM."
+  echo "✅ Đã gửi lệnh tạo xong."
 fi
 
 echo
@@ -210,17 +199,20 @@ echo "=== Bước 4: Cài đặt Proxy song song ==="
 declare -A LOG_FILES
 declare -A PIDS
 
-# Lọc lại danh sách VM thực tế đang chạy (phòng trường hợp lệnh tạo VM fail 1 vài con)
+# Lọc lại danh sách VM thực tế đang chạy
 ACTUAL_RUNNING_VMS=()
 for NAME in "${NEW_VM_NAMES[@]}"; do
-  if gcloud compute instances describe "$NAME" --zone="$ZONE" --format="value(status)" --quiet 2>/dev/null | grep -q "RUNNING"; then
+  # Kiểm tra nhanh xem VM có tồn tại và đang chạy không
+  STATUS=$(gcloud compute instances describe "$NAME" --zone="$ZONE" --format="value(status)" --quiet 2>/dev/null || true)
+  if [[ "$STATUS" == "RUNNING" ]]; then
     ACTUAL_RUNNING_VMS+=("$NAME")
   fi
 done
 
 if [[ "${#ACTUAL_RUNNING_VMS[@]}" -eq 0 ]]; then
     echo "❌ Không có VM nào ở trạng thái RUNNING để cài đặt."
-    exit 1
+    echo "   (Có thể do lỗi Quota nên không VM nào được tạo thành công)"
+    exit 0
 fi
 
 for NAME in "${ACTUAL_RUNNING_VMS[@]}"; do
