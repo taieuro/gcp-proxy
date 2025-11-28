@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Script chạy trong Cloud Shell để:
 # - Hỏi bạn muốn proxy ở đâu (1=Tokyo, 2=Osaka, 3=Seoul)
 # - Tự dò quota IN_USE_ADDRESSES trong region đó và đặt NUM_VMS = số VM tối đa có thể tạo thêm
@@ -15,14 +16,17 @@ set -eo pipefail
 #######################################
 # CẤU HÌNH CÓ THỂ SỬA NHẸ
 #######################################
-VM_NAME_PREFIX="proxy-vm"      # proxy-vm-1, proxy-vm-2, ...
-REGION=""                      # sẽ chọn bằng menu
-ZONE=""                        # auto pick theo region
+
+VM_NAME_PREFIX="proxy-vm"        # proxy-vm-1, proxy-vm-2, ...
+REGION=""                        # sẽ chọn bằng menu
+ZONE=""                          # auto pick theo region
+
 MACHINE_TYPE="e2-micro"
 IMAGE_FAMILY="debian-12"
 IMAGE_PROJECT="debian-cloud"
+
 DISK_SIZE="10GB"
-DISK_TYPE="pd-standard"        # New standard persistent disk
+DISK_TYPE="pd-standard"          # New standard persistent disk
 NETWORK="default"
 
 # Tags giống UI: tick 3 ô HTTP/HTTPS/LB + tag proxy-vm cho firewall
@@ -34,7 +38,8 @@ PROXY_INSTALL_URL="https://raw.githubusercontent.com/taieuro/gcp-proxy/main/inst
 #######################################
 # THÔNG TIN PROJECT
 #######################################
-PROJECT="$(gcloud config get-value project 2>/dev/null || echo)"
+
+PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
 if [[ -z "$PROJECT" ]]; then
   echo "❌ Không lấy được project hiện tại."
   echo "   Hãy chạy: gcloud config set project <PROJECT_ID>"
@@ -44,24 +49,23 @@ fi
 #######################################
 # BƯỚC 0: MENU CHỌN REGION (1/2/3)
 #######################################
-cat << 'MENU'
-=== Chọn location cho proxy ===
-  1) Tokyo, Japan  (asia-northeast1)
-  2) Osaka, Japan  (asia-northeast2)
-  3) Seoul, Korea  (asia-northeast3)
-MENU
+
+echo "=== Chọn location cho proxy ==="
+echo "  1) Tokyo, Japan  (asia-northeast1)"
+echo "  2) Osaka, Japan  (asia-northeast2)"
+echo "  3) Seoul, Korea  (asia-northeast3)"
 
 REGION_CHOICE=""
+
 if [[ -r /dev/tty ]]; then
-  # Khi chạy curl | bash, stdin là script → ta đọc từ /dev/tty để lấy input từ user
   printf "Nhập lựa chọn (1/2/3): " > /dev/tty
   read -r REGION_CHOICE < /dev/tty
 else
-  # Trường hợp script chạy trực tiếp (bash create-proxy-vms.sh)
   read -rp "Nhập lựa chọn (1/2/3): " REGION_CHOICE
 fi
 
 REGION_LABEL=""
+
 case "$REGION_CHOICE" in
   1)
     REGION="asia-northeast1"
@@ -81,20 +85,23 @@ case "$REGION_CHOICE" in
     ;;
 esac
 
-printf '\nBạn đã chọn: %s (%s)\n\n' "$REGION_LABEL" "$REGION"
+echo
+echo "Bạn đã chọn: $REGION_LABEL ($REGION)"
+echo
 
 #######################################
 # BƯỚC 0.1: DÒ QUOTA IN_USE_ADDRESSES
 #######################################
+
 echo "=== Bước 0: Kiểm tra quota IN_USE_ADDRESSES trong region $REGION ==="
 
 NUM_VMS_DEFAULT=1
 NUM_VMS="$NUM_VMS_DEFAULT"
 
-QUOTA_LINE="$(gcloud compute regions describe "$REGION" \
+QUOTA_LINE=$( gcloud compute regions describe "$REGION" \
   --project="$PROJECT" \
   --format='value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)' \
-  2>/dev/null || true)"
+  2>/dev/null || true )
 
 if [[ -z "$QUOTA_LINE" ]]; then
   echo "⚠ Không lấy được quota IN_USE_ADDRESSES (có thể do quyền hoặc format)."
@@ -102,6 +109,7 @@ if [[ -z "$QUOTA_LINE" ]]; then
 else
   LIMIT=""
   USAGE=""
+
   read -r LIMIT USAGE <<< "$QUOTA_LINE"
 
   LIMIT_INT="${LIMIT%.*}"
@@ -121,9 +129,9 @@ else
     REMAINING=$((LIMIT_INT - USAGE_INT))
 
     echo "Quota IN_USE_ADDRESSES:"
-    echo "  - Limit : $LIMIT_INT"
+    echo "  - Limit    : $LIMIT_INT"
     echo "  - Đang dùng: $USAGE_INT"
-    echo "  - Còn lại : $REMAINING (external IP có thể dùng thêm)"
+    echo "  - Còn lại  : $REMAINING (external IP có thể dùng thêm)"
 
     if (( REMAINING <= 0 )); then
       echo "❗ Quota còn lại = 0, không tạo được thêm VM."
@@ -140,13 +148,15 @@ echo
 #######################################
 # BƯỚC 0.2: TỰ CHỌN ZONE TRONG REGION
 #######################################
+
 if [[ -z "$ZONE" ]]; then
   echo "⏳ Đang tự chọn 1 zone trong region $REGION ..."
-  ZONE="$(gcloud compute zones list \
+  ZONE=$( gcloud compute zones list \
     --filter="region:($REGION) AND status=UP" \
-    --format='value(name)' | head -n 1 || true)"
+    --format='value(name)' | head -n 1 || true )
   if [[ -z "$ZONE" ]]; then
-    echo "❌ Không tìm được zone nào trong region $REGION. Kiểm tra lại REGION/Zones."
+    echo "❌ Không tìm được zone nào trong region $REGION."
+    echo "   Kiểm tra lại REGION/Zones."
     exit 1
   fi
 fi
@@ -163,15 +173,17 @@ printf 'Disk type     : %s (New standard persistent disk)\n' "$DISK_TYPE"
 printf 'Network       : %s\n' "$NETWORK"
 printf 'Tags          : %s\n' "$TAGS"
 printf 'Firewall rule : %s (tcp:20000-60000, 0.0.0.0/0, target tag=proxy-vm)\n' "$FIREWALL_NAME"
-printf 'Proxy script  : %s\n\n' "$PROXY_INSTALL_URL"
+printf 'Proxy script  : %s\n' "$PROXY_INSTALL_URL"
+echo
 
 #######################################
-# BƯỚC 1: TẠO FIREWALL RULE
+# BƯỚC 1: TẠO (HOẶC DÙNG LẠI) FIREWALL
 #######################################
+
 echo "=== Bước 1: Tạo (hoặc dùng lại) firewall rule ==="
 
 if gcloud compute firewall-rules describe "$FIREWALL_NAME" \
-    --project="$PROJECT" >/dev/null 2>&1; then
+  --project="$PROJECT" >/dev/null 2>&1; then
   echo "✅ Firewall rule '$FIREWALL_NAME' đã tồn tại, dùng lại."
 else
   echo "⏳ Đang tạo firewall rule '$FIREWALL_NAME' ..."
@@ -192,12 +204,13 @@ echo
 #######################################
 # BƯỚC 2: TÌM INDEX & TẠO VM MỚI
 #######################################
+
 echo "=== Bước 2: Tìm chỉ số VM tiếp theo & tạo VM mới ==="
 
-EXISTING_NAMES="$(gcloud compute instances list \
+EXISTING_NAMES=$( gcloud compute instances list \
   --project="$PROJECT" \
   --filter="zone:($ZONE) AND name ~ '^${VM_NAME_PREFIX}-[0-9]+$'" \
-  --format='value(name)' || true)"
+  --format='value(name)' || true )
 
 MAX_INDEX=0
 
@@ -223,7 +236,7 @@ echo
 NEW_VM_NAMES=()
 i="$START_INDEX"
 while (( i <= END_INDEX )); do
-  NEW_VM_NAMES+=("${VM_NAME_PREFIX}-${i}")
+  NEW_VM_NAMES+=( "${VM_NAME_PREFIX}-${i}" )
   i=$((i + 1))
 done
 
@@ -233,18 +246,19 @@ if [[ "${#NEW_VM_NAMES[@]}" -eq 0 ]]; then
 fi
 
 echo "⏳ Đang tạo các VM mới: ${NEW_VM_NAMES[*]} ..."
-TMP_ERR="$(mktemp)"
+TMP_ERR=$(mktemp)
 
 if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
-    --project="$PROJECT" \
-    --zone="$ZONE" \
-    --machine-type="$MACHINE_TYPE" \
-    --image-family="$IMAGE_FAMILY" \
-    --image-project="$IMAGE_PROJECT" \
-    --boot-disk-size="$DISK_SIZE" \
-    --boot-disk-type="$DISK_TYPE" \
-    --network="$NETWORK" \
-    --tags="$TAGS" 2>"$TMP_ERR"; then
+  --project="$PROJECT" \
+  --zone="$ZONE" \
+  --machine-type="$MACHINE_TYPE" \
+  --image-family="$IMAGE_FAMILY" \
+  --image-project="$IMAGE_PROJECT" \
+  --boot-disk-size="$DISK_SIZE" \
+  --boot-disk-type="$DISK_TYPE" \
+  --network="$NETWORK" \
+  --tags="$TAGS" 2>"$TMP_ERR"
+then
   echo "⚠ Lỗi khi tạo các VM mới:"
   cat "$TMP_ERR"
 
@@ -273,6 +287,7 @@ echo
 #######################################
 # BƯỚC 3: CHUẨN BỊ SSH KEY
 #######################################
+
 echo "=== Bước 3: Kiểm tra/generate SSH key cho gcloud ==="
 
 SSH_KEY_PRIV="$HOME/.ssh/google_compute_engine"
@@ -294,6 +309,7 @@ echo
 #######################################
 # BƯỚC 4: SSH CÀI PROXY TRÊN CÁC VM MỚI
 #######################################
+
 echo "=== Bước 4: Cài proxy trên các VM mới (SSH song song) ==="
 echo
 
@@ -329,18 +345,18 @@ for NAME in "${NEW_VM_NAMES[@]}"; do
 
   if wait "$PID"; then
     if grep -q "PROXY:" "$LOG_FILE"; then
-      PROXY_LINE="$(grep 'PROXY:' "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')"
+      PROXY_LINE=$(grep "PROXY:" "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')
       PROXIES["$NAME"]="$PROXY_LINE"
       echo "✅ VM '$NAME' cài proxy thành công."
     else
-      FAILED_VMS+=("$NAME")
+      FAILED_VMS+=( "$NAME" )
       echo "⚠ VM '$NAME' KHÔNG tìm thấy dòng PROXY trong log. Kiểm tra: $LOG_FILE"
       echo "---- Tail log $NAME ----"
       tail -n 20 "$LOG_FILE" || true
       echo "----------------------------"
     fi
   else
-    FAILED_VMS+=("$NAME")
+    FAILED_VMS+=( "$NAME" )
     echo "⚠ VM '$NAME' cài proxy lỗi. Kiểm tra: $LOG_FILE"
     echo "---- Tail log $NAME ----"
     tail -n 20 "$LOG_FILE" || true
