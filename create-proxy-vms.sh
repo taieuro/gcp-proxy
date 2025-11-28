@@ -92,6 +92,8 @@ echo
 #######################################
 echo "=== Bước 0: Kiểm tra quota IN_USE_ADDRESSES trong region $REGION ==="
 
+NUM_VMS=1  # giá trị mặc định, nếu không đọc được quota
+
 # Lấy limit & usage cho quota IN_USE_ADDRESSES
 QUOTA_LINE="$(gcloud compute regions describe "$REGION" \
   --project="$PROJECT" \
@@ -100,21 +102,20 @@ QUOTA_LINE="$(gcloud compute regions describe "$REGION" \
 
 if [[ -z "$QUOTA_LINE" ]]; then
   echo "⚠ Không lấy được quota IN_USE_ADDRESSES (có thể do quyền hoặc format)."
-  echo "   Tạm dùng NUM_VMS = 1."
-  NUM_VMS=1
+  echo "   Tạm dùng NUM_VMS = $NUM_VMS."
 else
   # QUOTA_LINE dạng: "4.0 2.0"
+  LIMIT=""
+  USAGE=""
   read -r LIMIT USAGE <<< "$QUOTA_LINE"
 
   # Bỏ phần thập phân nếu có (4.0 -> 4)
   LIMIT_INT="${LIMIT%.*}"
   USAGE_INT="${USAGE%.*}"
 
-  # Nếu vẫn rỗng thì fallback
   if [[ -z "$LIMIT_INT" || -z "$USAGE_INT" ]]; then
     echo "⚠ Không parse được quota IN_USE_ADDRESSES (LIMIT=$LIMIT, USAGE=$USAGE)."
-    echo "   Tạm dùng NUM_VMS = 1."
-    NUM_VMS=1
+    echo "   Tạm dùng NUM_VMS = $NUM_VMS."
   else
     if (( USAGE_INT >= LIMIT_INT )); then
       echo "❗ Quota IN_USE_ADDRESSES trong region $REGION đã đầy."
@@ -130,7 +131,6 @@ else
     echo "  - Đang dùng: $USAGE_INT"
     echo "  - Còn lại : $REMAINING (external IP có thể dùng thêm)"
 
-    # ✔ Gán NUM_VMS = giá trị tối đa còn lại
     NUM_VMS=$REMAINING
 
     echo "=> Sẽ tạo NUM_VMS = $NUM_VMS VM mới trong lần chạy này."
@@ -206,9 +206,9 @@ EXISTING_NAMES="$(gcloud compute instances list \
 MAX_INDEX=0
 
 if [[ -n "$EXISTING_NAMES" ]]; then
-  while IFS= read -r NAME; do
-    [[ -z "$NAME" ]] && continue
-    IDX="${NAME##*-}"
+  while IFS= read -r EXISTING_NAME; do
+    [[ -z "$EXISTING_NAME" ]] && continue
+    IDX="${EXISTING_NAME##*-}"
     if [[ "$IDX" =~ ^[0-9]+$ ]]; then
       if (( IDX > MAX_INDEX )); then
         MAX_INDEX=$IDX
@@ -306,20 +306,20 @@ echo
 declare -A LOG_FILES
 declare -A PIDS
 
-for VM_NAME in "${NEW_VM_NAMES[@]}"; do
-  LOG_FILE="/tmp/${VM_NAME}.proxy.log"
-  LOG_FILES["$VM_NAME"]="$LOG_FILE"
+for VM_NAME_LOCAL in "${NEW_VM_NAMES[@]}"; do
+  LOG_FILE="/tmp/${VM_NAME_LOCAL}.proxy.log"
+  LOG_FILES["$VM_NAME_LOCAL"]="$LOG_FILE"
 
-  echo "▶ Bắt đầu cài proxy trên VM '$VM_NAME' (log: $LOG_FILE)..."
+  echo "▶ Bắt đầu cài proxy trên VM '$VM_NAME_LOCAL' (log: $LOG_FILE)..."
 
-  gcloud compute ssh "$VM_NAME" \
+  gcloud compute ssh "$VM_NAME_LOCAL" \
         --zone="$ZONE" \
         --project="$PROJECT" \
         --quiet \
         --command="curl -s $PROXY_INSTALL_URL | sudo bash" \
         >"$LOG_FILE" 2>&1 &
 
-  PIDS["$VM_NAME"]=$!
+  PIDS["$VM_NAME_LOCAL"]=$!
 done
 
 echo
@@ -329,26 +329,26 @@ echo
 declare -A PROXIES
 FAILED_VMS=()
 
-for VM_NAME in "${NEW_VM_NAMES[@]}"; do
-  PID="${PIDS[$VM_NAME]}"
-  LOG_FILE="${LOG_FILES[$VM_NAME]}"
+for VM_NAME_LOCAL in "${NEW_VM_NAMES[@]}"; do
+  PID="${PIDS[$VM_NAME_LOCAL]}"
+  LOG_FILE="${LOG_FILES[$VM_NAME_LOCAL]}"
 
   if wait "$PID"; then
     if grep -q "PROXY:" "$LOG_FILE"; then
       PROXY_LINE=$(grep "PROXY:" "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')
-      PROXIES["$VM_NAME"]="$PROXY_LINE"
-      echo "✅ VM '$VM_NAME' cài proxy thành công."
+      PROXIES["$VM_NAME_LOCAL"]="$PROXY_LINE"
+      echo "✅ VM '$VM_NAME_LOCAL' cài proxy thành công."
     else
-      FAILED_VMS+=("$VM_NAME")
-      echo "⚠ VM '$VM_NAME' KHÔNG tìm thấy dòng PROXY trong log. Kiểm tra: $LOG_FILE"
-      echo "---- Tail log $VM_NAME ----"
+      FAILED_VMS+=("$VM_NAME_LOCAL")
+      echo "⚠ VM '$VM_NAME_LOCAL' KHÔNG tìm thấy dòng PROXY trong log. Kiểm tra: $LOG_FILE"
+      echo "---- Tail log $VM_NAME_LOCAL ----"
       tail -n 20 "$LOG_FILE" || true
       echo "----------------------------"
     fi
   else
-    FAILED_VMS+=("$VM_NAME")
-    echo "⚠ VM '$VM_NAME' cài proxy lỗi. Kiểm tra: $LOG_FILE"
-    echo "---- Tail log $VM_NAME ----"
+    FAILED_VMS+=("$VM_NAME_LOCAL")
+    echo "⚠ VM '$VM_NAME_LOCAL' cài proxy lỗi. Kiểm tra: $LOG_FILE"
+    echo "---- Tail log $VM_NAME_LOCAL ----"
     tail -n 20 "$LOG_FILE" || true
     echo "----------------------------"
   fi
@@ -356,11 +356,11 @@ done
 
 echo
 echo "================= TỔNG HỢP PROXY MỚI ĐÃ TẠO ================="
-for VM_NAME in "${NEW_VM_NAMES[@]}"; do
-  if [[ -n "${PROXIES[$VM_NAME]:-}" ]]; then
-    echo "$VM_NAME: ${PROXIES[$VM_NAME]}"
+for VM_NAME_LOCAL in "${NEW_VM_NAMES[@]}"; do
+  if [[ -n "${PROXIES[$VM_NAME_LOCAL]:-}" ]]; then
+    echo "$VM_NAME_LOCAL: ${PROXIES[$VM_NAME_LOCAL]}"
   else
-    echo "$VM_NAME: (FAILED - xem log: ${LOG_FILES[$VM_NAME]})"
+    echo "$VM_NAME_LOCAL: (FAILED - xem log: ${LOG_FILES[$VM_NAME_LOCAL]})"
   fi
 done
 echo "============================================================="
