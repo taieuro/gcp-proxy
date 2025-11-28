@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Script chạy trong Cloud Shell để:
-# - Hỏi bạn muốn proxy ở đâu (1=Tokyo, 2=Osaka, 3=Seoul)
-# - Tự dò quota IN_USE_ADDRESSES trong region đó và đặt NUM_VMS = số VM tối đa có thể tạo thêm
-# - Mỗi lần chạy tạo THÊM NUM_VMS VM mới (tên tăng dần: proxy-vm-1,2,3...)
+# - Hỏi location proxy (1=Tokyo, 2=Osaka, 3=Seoul)
+# - Dò quota IN_USE_ADDRESSES trong region đó và đặt NUM_VMS = số VM tối đa có thể tạo thêm
+# - Mỗi lần chạy tạo THÊM NUM_VMS VM mới (proxy-vm-1,2,3,...)
 # - Tạo firewall rule chung cho proxy ports (nếu chưa có)
 # - SSH song song vào từng VM MỚI và chạy install.sh tạo proxy
 # - Cuối cùng in list proxy CỦA CÁC VM MỚI tạo trong lần chạy này
@@ -10,31 +10,27 @@
 # Cách chạy:
 #   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
 
-set -eo pipefail   # KHÔNG dùng -u để tránh lỗi "unbound variable" khi chạy qua curl
+set -eo pipefail
 
 #######################################
-# CẤU HÌNH CÓ THỂ SỬA NHẸ (nếu muốn)
+# CẤU HÌNH CÓ THỂ SỬA NHẸ
 #######################################
-VM_NAME_PREFIX="proxy-vm"        # Prefix tên VM: proxy-vm-1, proxy-vm-2, ...
-
-# REGION & ZONE sẽ được chọn bằng menu, nên để trống
-REGION=""
-ZONE=""
-
-MACHINE_TYPE="e2-micro"          # Loại máy
-IMAGE_FAMILY="debian-12"         # Hệ điều hành
+VM_NAME_PREFIX="proxy-vm"      # proxy-vm-1, proxy-vm-2, ...
+REGION=""                      # sẽ chọn bằng menu
+ZONE=""                        # auto pick
+MACHINE_TYPE="e2-micro"
+IMAGE_FAMILY="debian-12"
 IMAGE_PROJECT="debian-cloud"
 DISK_SIZE="10GB"
-DISK_TYPE="pd-standard"          # New standard persistent disk (New standard persistent disk)
+DISK_TYPE="pd-standard"        # New standard persistent disk
+NETWORK="default"
 
-NETWORK="default"                # Tên VPC network
-
-# Networking tags (giống UI):
-# - proxy-vm: dùng cho firewall rule gcp-proxy-ports (tcp:20000-60000)
-# - http-server, https-server, lb-health-check: tương đương tick 3 checkbox trong UI
+# Networking tags:
+# - proxy-vm: cho firewall rule gcp-proxy-ports
+# - http-server, https-server, lb-health-check: tick 3 ô trong UI
 TAGS="proxy-vm,http-server,https-server,lb-health-check"
 
-FIREWALL_NAME="gcp-proxy-ports"  # Tên firewall rule cho proxy port
+FIREWALL_NAME="gcp-proxy-ports"
 PROXY_INSTALL_URL="https://raw.githubusercontent.com/taieuro/gcp-proxy/main/install.sh"
 
 #######################################
@@ -88,7 +84,7 @@ echo "Bạn đã chọn: $REGION_LABEL ($REGION)"
 echo
 
 #######################################
-# BƯỚC 0.1: DÒ QUOTA IN_USE_ADDRESSES VÀ ĐẶT NUM_VMS
+# BƯỚC 0.1: DÒ QUOTA IN_USE_ADDRESSES
 #######################################
 echo "=== Bước 0: Kiểm tra quota IN_USE_ADDRESSES trong region $REGION ==="
 
@@ -97,7 +93,7 @@ NUM_VMS="$NUM_VMS_DEFAULT"
 
 QUOTA_LINE=$( gcloud compute regions describe "$REGION" \
   --project="$PROJECT" \
-  --format='value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)' \
+  --format="value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)" \
   2>/dev/null ) || QUOTA_LINE=""
 
 if [[ -z "$QUOTA_LINE" ]]; then
@@ -144,11 +140,11 @@ echo
 #######################################
 # BƯỚC 0.2: TỰ CHỌN ZONE TRONG REGION
 #######################################
-if [[ -z "${ZONE}" ]]; then
+if [[ -z "$ZONE" ]]; then
   echo "⏳ Đang tự chọn 1 zone trong region $REGION ..."
   ZONE="$(gcloud compute zones list \
-            --filter="region:($REGION) AND status:UP" \
-            --format="value(name)" | head -n 1 || true)"
+    --filter="region:($REGION) AND status:UP" \
+    --format="value(name)" | head -n 1 || true)"
   if [[ -z "$ZONE" ]]; then
     echo "❌ Không tìm được zone nào trong region $REGION. Kiểm tra lại REGION/Zones."
     exit 1
@@ -171,7 +167,7 @@ echo "Proxy script  : $PROXY_INSTALL_URL"
 echo
 
 #######################################
-# BƯỚC 1: TẠO FIREWALL RULE (DÙNG CHUNG)
+# BƯỚC 1: TẠO FIREWALL RULE
 #######################################
 echo "=== Bước 1: Tạo (hoặc dùng lại) firewall rule ==="
 
@@ -195,7 +191,7 @@ fi
 echo
 
 #######################################
-# BƯỚC 2: XÁC ĐỊNH CHỈ SỐ VM TIẾP THEO & TẠO VM MỚI
+# BƯỚC 2: TÌM INDEX & TẠO VM MỚI
 #######################################
 echo "=== Bước 2: Tìm chỉ số VM tiếp theo & tạo VM mới ==="
 
@@ -238,8 +234,8 @@ if [[ "${#NEW_VM_NAMES[@]}" -eq 0 ]]; then
 fi
 
 echo "⏳ Đang tạo các VM mới: ${NEW_VM_NAMES[*]} ..."
-
 TMP_ERR="$(mktemp)"
+
 if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
       --project="$PROJECT" \
       --zone="$ZONE" \
@@ -250,7 +246,6 @@ if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
       --boot-disk-type="$DISK_TYPE" \
       --network="$NETWORK" \
       --tags="$TAGS" 2>"$TMP_ERR"; then
-
   echo "⚠ Lỗi khi tạo các VM mới:"
   cat "$TMP_ERR"
 
@@ -267,17 +262,17 @@ if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
   echo "❌ Lỗi không phải quota IN_USE_ADDRESSES. Thoát."
   exit 1
 fi
+
 rm -f "$TMP_ERR"
 
 echo "✅ Đã tạo xong các VM mới."
 echo
-
 echo "⏳ Đợi 30 giây để các VM mới khởi động dịch vụ SSH..."
 sleep 30
 echo
 
 #######################################
-# BƯỚC 3: CHUẨN BỊ SSH KEY CHO GCLOUD (TRÁNH LỖI OVERWRITE)
+# BƯỚC 3: SSH KEY CHO GCLOUD
 #######################################
 echo "=== Bước 3: Kiểm tra/generate SSH key cho gcloud ==="
 
@@ -298,7 +293,7 @@ fi
 echo
 
 #######################################
-# BƯỚC 4: SSH SONG SONG VÀO TỪNG VM MỚI, CHẠY install.sh
+# BƯỚC 4: SSH SONG SONG & CÀI PROXY
 #######################################
 echo "=== Bước 4: Cài proxy trên các VM mới (SSH song song) ==="
 echo
