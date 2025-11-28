@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Script chạy trong Cloud Shell để:
-# - Hỏi location proxy (1=Tokyo, 2=Osaka, 3=Seoul)
-# - Dò quota IN_USE_ADDRESSES trong region đó và đặt NUM_VMS = số VM tối đa có thể tạo thêm
-# - Mỗi lần chạy tạo THÊM NUM_VMS VM mới (proxy-vm-1,2,3,...)
+# - Hỏi bạn muốn proxy ở đâu (1=Tokyo, 2=Osaka, 3=Seoul)
+# - Tự dò quota IN_USE_ADDRESSES trong region đó và đặt NUM_VMS = số VM tối đa có thể tạo thêm
+# - Mỗi lần chạy tạo THÊM NUM_VMS VM mới (tên tăng dần: proxy-vm-1,2,3...)
 # - Tạo firewall rule chung cho proxy ports (nếu chưa có)
 # - SSH song song vào từng VM MỚI và chạy install.sh tạo proxy
 # - Cuối cùng in list proxy CỦA CÁC VM MỚI tạo trong lần chạy này
@@ -17,7 +17,7 @@ set -eo pipefail
 #######################################
 VM_NAME_PREFIX="proxy-vm"      # proxy-vm-1, proxy-vm-2, ...
 REGION=""                      # sẽ chọn bằng menu
-ZONE=""                        # auto pick
+ZONE=""                        # auto pick theo region
 MACHINE_TYPE="e2-micro"
 IMAGE_FAMILY="debian-12"
 IMAGE_PROJECT="debian-cloud"
@@ -25,9 +25,7 @@ DISK_SIZE="10GB"
 DISK_TYPE="pd-standard"        # New standard persistent disk
 NETWORK="default"
 
-# Networking tags:
-# - proxy-vm: cho firewall rule gcp-proxy-ports
-# - http-server, https-server, lb-health-check: tick 3 ô trong UI
+# Tags giống UI: tick 3 ô HTTP/HTTPS/LB + tag proxy-vm cho firewall
 TAGS="proxy-vm,http-server,https-server,lb-health-check"
 
 FIREWALL_NAME="gcp-proxy-ports"
@@ -36,7 +34,7 @@ PROXY_INSTALL_URL="https://raw.githubusercontent.com/taieuro/gcp-proxy/main/inst
 #######################################
 # THÔNG TIN PROJECT
 #######################################
-PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
+PROJECT="$(gcloud config get-value project 2>/dev/null || echo)"
 if [[ -z "$PROJECT" ]]; then
   echo "❌ Không lấy được project hiện tại."
   echo "   Hãy chạy: gcloud config set project <PROJECT_ID>"
@@ -46,18 +44,14 @@ fi
 #######################################
 # BƯỚC 0: MENU CHỌN REGION (1/2/3)
 #######################################
-echo "=== Chọn location cho proxy ==="
-echo "  1) Tokyo, Japan  (asia-northeast1)"
-echo "  2) Osaka, Japan  (asia-northeast2)"
-echo "  3) Seoul, Korea  (asia-northeast3)"
+cat <<'MENU'
+=== Chọn location cho proxy ===
+  1) Tokyo, Japan  (asia-northeast1)
+  2) Osaka, Japan  (asia-northeast2)
+  3) Seoul, Korea  (asia-northeast3)
+MENU
 
-REGION_CHOICE=""
-if [[ -r /dev/tty ]]; then
-  printf "Nhập lựa chọn (1/2/3): " > /dev/tty
-  read -r REGION_CHOICE < /dev/tty
-else
-  read -rp "Nhập lựa chọn (1/2/3): " REGION_CHOICE
-fi
+read -r -p "Nhập lựa chọn (1/2/3): " REGION_CHOICE
 
 REGION_LABEL=""
 case "$REGION_CHOICE" in
@@ -79,9 +73,7 @@ case "$REGION_CHOICE" in
     ;;
 esac
 
-echo
-echo "Bạn đã chọn: $REGION_LABEL ($REGION)"
-echo
+printf 'Bạn đã chọn: %s (%s)\n\n' "$REGION_LABEL" "$REGION"
 
 #######################################
 # BƯỚC 0.1: DÒ QUOTA IN_USE_ADDRESSES
@@ -91,10 +83,10 @@ echo "=== Bước 0: Kiểm tra quota IN_USE_ADDRESSES trong region $REGION ==="
 NUM_VMS_DEFAULT=1
 NUM_VMS="$NUM_VMS_DEFAULT"
 
-QUOTA_LINE=$( gcloud compute regions describe "$REGION" \
+QUOTA_LINE="$(gcloud compute regions describe "$REGION" \
   --project="$PROJECT" \
-  --format="value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)" \
-  2>/dev/null ) || QUOTA_LINE=""
+  --format='value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)' \
+  2>/dev/null || true)"
 
 if [[ -z "$QUOTA_LINE" ]]; then
   echo "⚠ Không lấy được quota IN_USE_ADDRESSES (có thể do quyền hoặc format)."
@@ -143,8 +135,8 @@ echo
 if [[ -z "$ZONE" ]]; then
   echo "⏳ Đang tự chọn 1 zone trong region $REGION ..."
   ZONE="$(gcloud compute zones list \
-    --filter="region:($REGION) AND status:UP" \
-    --format="value(name)" | head -n 1 || true)"
+    --filter="region:($REGION) AND status=UP" \
+    --format='value(name)' | head -n 1 || true)"
   if [[ -z "$ZONE" ]]; then
     echo "❌ Không tìm được zone nào trong region $REGION. Kiểm tra lại REGION/Zones."
     exit 1
@@ -152,19 +144,18 @@ if [[ -z "$ZONE" ]]; then
 fi
 
 echo "=== Thông tin cấu hình ==="
-echo "Project       : $PROJECT"
-echo "Region        : $REGION ($REGION_LABEL)"
-echo "Zone          : $ZONE"
-echo "Số VM mới     : $NUM_VMS"
-echo "VM name prefix: $VM_NAME_PREFIX"
-echo "Machine type  : $MACHINE_TYPE"
-echo "Disk size     : $DISK_SIZE"
-echo "Disk type     : $DISK_TYPE (New standard persistent disk)"
-echo "Network       : $NETWORK"
-echo "Tags          : $TAGS"
-echo "Firewall rule : $FIREWALL_NAME (tcp:20000-60000, 0.0.0.0/0, target tag=proxy-vm)"
-echo "Proxy script  : $PROXY_INSTALL_URL"
-echo
+printf 'Project       : %s\n' "$PROJECT"
+printf 'Region        : %s (%s)\n' "$REGION" "$REGION_LABEL"
+printf 'Zone          : %s\n' "$ZONE"
+printf 'Số VM mới     : %s\n' "$NUM_VMS"
+printf 'VM name prefix: %s\n' "$VM_NAME_PREFIX"
+printf 'Machine type  : %s\n' "$MACHINE_TYPE"
+printf 'Disk size     : %s\n' "$DISK_SIZE"
+printf 'Disk type     : %s (New standard persistent disk)\n' "$DISK_TYPE"
+printf 'Network       : %s\n' "$NETWORK"
+printf 'Tags          : %s\n' "$TAGS"
+printf 'Firewall rule : %s (tcp:20000-60000, 0.0.0.0/0, target tag=proxy-vm)\n' "$FIREWALL_NAME"
+printf 'Proxy script  : %s\n\n' "$PROXY_INSTALL_URL"
 
 #######################################
 # BƯỚC 1: TẠO FIREWALL RULE
@@ -198,7 +189,7 @@ echo "=== Bước 2: Tìm chỉ số VM tiếp theo & tạo VM mới ==="
 EXISTING_NAMES="$(gcloud compute instances list \
   --project="$PROJECT" \
   --filter="zone:($ZONE) AND name ~ '^${VM_NAME_PREFIX}-[0-9]+$'" \
-  --format="value(name)" || true)"
+  --format='value(name)' || true)"
 
 MAX_INDEX=0
 
@@ -237,15 +228,15 @@ echo "⏳ Đang tạo các VM mới: ${NEW_VM_NAMES[*]} ..."
 TMP_ERR="$(mktemp)"
 
 if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
-      --project="$PROJECT" \
-      --zone="$ZONE" \
-      --machine-type="$MACHINE_TYPE" \
-      --image-family="$IMAGE_FAMILY" \
-      --image-project="$IMAGE_PROJECT" \
-      --boot-disk-size="$DISK_SIZE" \
-      --boot-disk-type="$DISK_TYPE" \
-      --network="$NETWORK" \
-      --tags="$TAGS" 2>"$TMP_ERR"; then
+    --project="$PROJECT" \
+    --zone="$ZONE" \
+    --machine-type="$MACHINE_TYPE" \
+    --image-family="$IMAGE_FAMILY" \
+    --image-project="$IMAGE_PROJECT" \
+    --boot-disk-size="$DISK_SIZE" \
+    --boot-disk-type="$DISK_TYPE" \
+    --network="$NETWORK" \
+    --tags="$TAGS" 2>"$TMP_ERR"; then
   echo "⚠ Lỗi khi tạo các VM mới:"
   cat "$TMP_ERR"
 
@@ -272,7 +263,7 @@ sleep 30
 echo
 
 #######################################
-# BƯỚC 3: SSH KEY CHO GCLOUD
+# BƯỚC 3: CHUẨN BỊ SSH KEY
 #######################################
 echo "=== Bước 3: Kiểm tra/generate SSH key cho gcloud ==="
 
@@ -293,7 +284,7 @@ fi
 echo
 
 #######################################
-# BƯỚC 4: SSH SONG SONG & CÀI PROXY
+# BƯỚC 4: SSH CÀI PROXY TRÊN CÁC VM MỚI
 #######################################
 echo "=== Bước 4: Cài proxy trên các VM mới (SSH song song) ==="
 echo
@@ -308,11 +299,11 @@ for NAME in "${NEW_VM_NAMES[@]}"; do
   echo "▶ Bắt đầu cài proxy trên VM '$NAME' (log: $LOG_FILE)..."
 
   gcloud compute ssh "$NAME" \
-        --zone="$ZONE" \
-        --project="$PROJECT" \
-        --quiet \
-        --command="curl -s $PROXY_INSTALL_URL | sudo bash" \
-        >"$LOG_FILE" 2>&1 &
+    --zone="$ZONE" \
+    --project="$PROJECT" \
+    --quiet \
+    --command="curl -s $PROXY_INSTALL_URL | sudo bash" \
+    >"$LOG_FILE" 2>&1 &
 
   PIDS["$NAME"]=$!
 done
@@ -330,7 +321,7 @@ for NAME in "${NEW_VM_NAMES[@]}"; do
 
   if wait "$PID"; then
     if grep -q "PROXY:" "$LOG_FILE"; then
-      PROXY_LINE=$(grep "PROXY:" "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')
+      PROXY_LINE="$(grep 'PROXY:' "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')"
       PROXIES["$NAME"]="$PROXY_LINE"
       echo "✅ VM '$NAME' cài proxy thành công."
     else
