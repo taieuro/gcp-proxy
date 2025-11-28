@@ -10,7 +10,7 @@
 # Cách chạy:
 #   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
 
-set -euo pipefail
+set -eo pipefail   # KHÔNG dùng -u để tránh lỗi "unbound variable" khi chạy qua curl
 
 #######################################
 # CẤU HÌNH CÓ THỂ SỬA NHẸ (nếu muốn)
@@ -92,24 +92,22 @@ echo
 #######################################
 echo "=== Bước 0: Kiểm tra quota IN_USE_ADDRESSES trong region $REGION ==="
 
-NUM_VMS=1  # giá trị mặc định, nếu không đọc được quota
+NUM_VMS_DEFAULT=1
+NUM_VMS="$NUM_VMS_DEFAULT"
 
-# Lấy limit & usage cho quota IN_USE_ADDRESSES
 QUOTA_LINE="$(gcloud compute regions describe "$REGION" \
   --project="$PROJECT" \
   --format='value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)' \
-  2>/dev/null || echo "")"
+  2>/dev/null || true)"
 
 if [[ -z "$QUOTA_LINE" ]]; then
   echo "⚠ Không lấy được quota IN_USE_ADDRESSES (có thể do quyền hoặc format)."
   echo "   Tạm dùng NUM_VMS = $NUM_VMS."
 else
-  # QUOTA_LINE dạng: "4.0 2.0"
   LIMIT=""
   USAGE=""
   read -r LIMIT USAGE <<< "$QUOTA_LINE"
 
-  # Bỏ phần thập phân nếu có (4.0 -> 4)
   LIMIT_INT="${LIMIT%.*}"
   USAGE_INT="${USAGE%.*}"
 
@@ -131,8 +129,12 @@ else
     echo "  - Đang dùng: $USAGE_INT"
     echo "  - Còn lại : $REMAINING (external IP có thể dùng thêm)"
 
-    NUM_VMS=$REMAINING
+    if (( REMAINING <= 0 )); then
+      echo "❗ Quota còn lại = 0, không tạo được thêm VM."
+      exit 0
+    fi
 
+    NUM_VMS="$REMAINING"
     echo "=> Sẽ tạo NUM_VMS = $NUM_VMS VM mới trong lần chạy này."
   fi
 fi
@@ -197,7 +199,6 @@ echo
 #######################################
 echo "=== Bước 2: Tìm chỉ số VM tiếp theo & tạo VM mới ==="
 
-# Lấy danh sách VM hiện có trong ZONE với tên dạng prefix-<số>
 EXISTING_NAMES="$(gcloud compute instances list \
   --project="$PROJECT" \
   --filter="zone:($ZONE) AND name ~ '^${VM_NAME_PREFIX}-[0-9]+$'" \
@@ -225,8 +226,10 @@ echo "Sẽ tạo VM mới từ: ${VM_NAME_PREFIX}-${START_INDEX} đến ${VM_NAM
 echo
 
 NEW_VM_NAMES=()
-for i in $(seq "$START_INDEX" "$END_INDEX"); do
+i="$START_INDEX"
+while (( i <= END_INDEX )); do
   NEW_VM_NAMES+=("${VM_NAME_PREFIX}-${i}")
+  i=$((i + 1))
 done
 
 if [[ "${#NEW_VM_NAMES[@]}" -eq 0 ]]; then
@@ -237,7 +240,6 @@ fi
 echo "⏳ Đang tạo các VM mới: ${NEW_VM_NAMES[*]} ..."
 
 TMP_ERR="$(mktemp)"
-# Chỉ redirect stderr vào file để bắt lỗi quota, stdout vẫn in ra console
 if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
       --project="$PROJECT" \
       --zone="$ZONE" \
@@ -258,7 +260,6 @@ if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
     echo "   Không tạo thêm được VM mới trong region này."
     echo "   Các VM & proxy hiện có vẫn giữ nguyên, chỉ là lần chạy này không thêm VM mới."
     rm -f "$TMP_ERR"
-    # Thoát “êm” (exit 0) để lệnh curl | bash không bị báo lỗi đỏ
     exit 0
   fi
 
@@ -271,7 +272,6 @@ rm -f "$TMP_ERR"
 echo "✅ Đã tạo xong các VM mới."
 echo
 
-# ĐỢI VM KHỞI ĐỘNG SSH
 echo "⏳ Đợi 30 giây để các VM mới khởi động dịch vụ SSH..."
 sleep 30
 echo
@@ -306,20 +306,20 @@ echo
 declare -A LOG_FILES
 declare -A PIDS
 
-for VM_NAME_LOCAL in "${NEW_VM_NAMES[@]}"; do
-  LOG_FILE="/tmp/${VM_NAME_LOCAL}.proxy.log"
-  LOG_FILES["$VM_NAME_LOCAL"]="$LOG_FILE"
+for NAME in "${NEW_VM_NAMES[@]}"; do
+  LOG_FILE="/tmp/${NAME}.proxy.log"
+  LOG_FILES["$NAME"]="$LOG_FILE"
 
-  echo "▶ Bắt đầu cài proxy trên VM '$VM_NAME_LOCAL' (log: $LOG_FILE)..."
+  echo "▶ Bắt đầu cài proxy trên VM '$NAME' (log: $LOG_FILE)..."
 
-  gcloud compute ssh "$VM_NAME_LOCAL" \
+  gcloud compute ssh "$NAME" \
         --zone="$ZONE" \
         --project="$PROJECT" \
         --quiet \
         --command="curl -s $PROXY_INSTALL_URL | sudo bash" \
         >"$LOG_FILE" 2>&1 &
 
-  PIDS["$VM_NAME_LOCAL"]=$!
+  PIDS["$NAME"]=$!
 done
 
 echo
@@ -329,26 +329,26 @@ echo
 declare -A PROXIES
 FAILED_VMS=()
 
-for VM_NAME_LOCAL in "${NEW_VM_NAMES[@]}"; do
-  PID="${PIDS[$VM_NAME_LOCAL]}"
-  LOG_FILE="${LOG_FILES[$VM_NAME_LOCAL]}"
+for NAME in "${NEW_VM_NAMES[@]}"; do
+  PID="${PIDS[$NAME]}"
+  LOG_FILE="${LOG_FILES[$NAME]}"
 
   if wait "$PID"; then
     if grep -q "PROXY:" "$LOG_FILE"; then
       PROXY_LINE=$(grep "PROXY:" "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')
-      PROXIES["$VM_NAME_LOCAL"]="$PROXY_LINE"
-      echo "✅ VM '$VM_NAME_LOCAL' cài proxy thành công."
+      PROXIES["$NAME"]="$PROXY_LINE"
+      echo "✅ VM '$NAME' cài proxy thành công."
     else
-      FAILED_VMS+=("$VM_NAME_LOCAL")
-      echo "⚠ VM '$VM_NAME_LOCAL' KHÔNG tìm thấy dòng PROXY trong log. Kiểm tra: $LOG_FILE"
-      echo "---- Tail log $VM_NAME_LOCAL ----"
+      FAILED_VMS+=("$NAME")
+      echo "⚠ VM '$NAME' KHÔNG tìm thấy dòng PROXY trong log. Kiểm tra: $LOG_FILE"
+      echo "---- Tail log $NAME ----"
       tail -n 20 "$LOG_FILE" || true
       echo "----------------------------"
     fi
   else
-    FAILED_VMS+=("$VM_NAME_LOCAL")
-    echo "⚠ VM '$VM_NAME_LOCAL' cài proxy lỗi. Kiểm tra: $LOG_FILE"
-    echo "---- Tail log $VM_NAME_LOCAL ----"
+    FAILED_VMS+=("$NAME")
+    echo "⚠ VM '$NAME' cài proxy lỗi. Kiểm tra: $LOG_FILE"
+    echo "---- Tail log $NAME ----"
     tail -n 20 "$LOG_FILE" || true
     echo "----------------------------"
   fi
@@ -356,11 +356,11 @@ done
 
 echo
 echo "================= TỔNG HỢP PROXY MỚI ĐÃ TẠO ================="
-for VM_NAME_LOCAL in "${NEW_VM_NAMES[@]}"; do
-  if [[ -n "${PROXIES[$VM_NAME_LOCAL]:-}" ]]; then
-    echo "$VM_NAME_LOCAL: ${PROXIES[$VM_NAME_LOCAL]}"
+for NAME in "${NEW_VM_NAMES[@]}"; do
+  if [[ -n "${PROXIES[$NAME]:-}" ]]; then
+    echo "$NAME: ${PROXIES[$NAME]}"
   else
-    echo "$VM_NAME_LOCAL: (FAILED - xem log: ${LOG_FILES[$VM_NAME_LOCAL]})"
+    echo "$NAME: (FAILED - xem log: ${LOG_FILES[$NAME]})"
   fi
 done
 echo "============================================================="
