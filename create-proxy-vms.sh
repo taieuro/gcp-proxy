@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Script tạo Proxy an toàn (Fixed v2)
-# Cách chạy: Copy toàn bộ nội dung và paste vào Cloud Shell
+# Script tạo Proxy V3 (Max Speed & Max Quota)
+# Tính năng: Tự động tính toán số lượng VM tối đa còn lại và tạo hết trong 1 lần chạy.
+# Cách chạy:
+#   curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-vms.sh | bash
 
 set -eo pipefail
 
@@ -58,45 +60,57 @@ esac
 printf '\nBạn đã chọn: %s (%s)\n\n' "$REGION_LABEL" "$REGION"
 
 #######################################
-# BƯỚC 0.1: DÒ QUOTA (FIXED)
+# BƯỚC 0.1: DÒ QUOTA (LOGIC MỚI - CHÍNH XÁC HƠN)
 #######################################
-echo "=== Bước 0: Kiểm tra quota IN_USE_ADDRESSES ==="
+echo "=== Bước 0: Tính toán số lượng VM tối đa (Quota Check) ==="
 
-NUM_VMS=1 # Giá trị mặc định nếu không dò được
+# Lấy danh sách quota dưới dạng text dễ xử lý hơn json
+QUOTA_RAW="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="value(quotas)" --quiet || true)"
 
-# FIX: Thêm --quiet để không bị treo, gộp 1 dòng để tránh lỗi syntax
-QUOTA_LINE="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --quiet --format='value(quotas[metric=IN_USE_ADDRESSES].limit,quotas[metric=IN_USE_ADDRESSES].usage)' 2>/dev/null || true)"
+# Dùng grep và awk để tìm dòng IN_USE_ADDRESSES và lấy 2 số Limit, Usage
+# Định dạng output thường là: ...; metric=IN_USE_ADDRESSES; limit=8.0; usage=0.0; ...
+LIMIT_VAL=$(echo "$QUOTA_RAW" | grep -o "metric=IN_USE_ADDRESSES; limit=[0-9.]*; usage=[0-9.]*" | grep -o "limit=[0-9.]*" | cut -d= -f2 | cut -d. -f1)
+USAGE_VAL=$(echo "$QUOTA_RAW" | grep -o "metric=IN_USE_ADDRESSES; limit=[0-9.]*; usage=[0-9.]*" | grep -o "usage=[0-9.]*" | cut -d= -f2 | cut -d. -f1)
 
-if [[ -n "$QUOTA_LINE" ]]; then
-  read -r LIMIT USAGE <<< "$QUOTA_LINE"
-  LIMIT_INT="${LIMIT%.*}"
-  USAGE_INT="${USAGE%.*}"
-
-  if [[ -n "$LIMIT_INT" && -n "$USAGE_INT" ]]; then
-    REMAINING=$((LIMIT_INT - USAGE_INT))
-    echo "✔ Quota IP: Limit=$LIMIT_INT, Used=$USAGE_INT, Free=$REMAINING"
-    
-    if (( REMAINING <= 0 )); then
-      echo "❗ Đã hết Quota IP External. Không thể tạo thêm VM."
-      exit 0
+# Nếu không tìm thấy bằng grep (do format khác), thử phương án dự phòng gcloud filter
+if [[ -z "$LIMIT_VAL" ]]; then
+    echo "⚠ Phương án 1 không lấy được quota, thử phương án 2..."
+    QUOTA_V2="$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="value(quotas.limit,quotas.usage)" --filter="quotas.metric=IN_USE_ADDRESSES" --quiet || true)"
+    if [[ -n "$QUOTA_V2" ]]; then
+        read -r LIMIT_VAL USAGE_VAL <<< "$QUOTA_V2"
+        # Xóa phần thập phân nếu có
+        LIMIT_VAL="${LIMIT_VAL%.*}"
+        USAGE_VAL="${USAGE_VAL%.*}"
     fi
-    NUM_VMS="$REMAINING"
-  else
-    echo "⚠ Dữ liệu quota không hợp lệ, dùng mặc định: 1 VM."
-  fi
-else
-  echo "⚠ Không lấy được thông tin quota (có thể do quyền hạn hoặc API chưa bật)."
-  echo "👉 Đang dùng số lượng mặc định: 1 VM."
 fi
 
-echo "=> Sẽ tạo $NUM_VMS VM mới trong lần chạy này."
+NUM_VMS=0
+
+if [[ -n "$LIMIT_VAL" && -n "$USAGE_VAL" ]]; then
+    REMAINING=$((LIMIT_VAL - USAGE_VAL))
+    echo "📊 Thống kê Quota IP External:"
+    echo "   - Giới hạn (Limit): $LIMIT_VAL"
+    echo "   - Đang dùng (Used): $USAGE_VAL"
+    echo "   - Còn dư (Free)   : $REMAINING"
+    
+    if (( REMAINING <= 0 )); then
+        echo "❗ Đã hết sạch Quota IP (0). Không thể tạo thêm VM."
+        exit 0
+    fi
+    NUM_VMS="$REMAINING"
+else
+    # Fallback nếu mọi cách đều thất bại
+    echo "⚠ Không dò được Quota chính xác. Hệ thống sẽ cố gắng tạo 4 VM (mức an toàn)."
+    NUM_VMS=4
+fi
+
+echo "=> Sẽ tiến hành tạo đồng loạt: $NUM_VMS VM."
 echo
 
 #######################################
 # BƯỚC 0.2: TỰ CHỌN ZONE
 #######################################
 if [[ -z "$ZONE" ]]; then
-  # FIX: Thêm --quiet
   ZONE="$(gcloud compute zones list --filter="region:($REGION) AND status=UP" --quiet --format='value(name)' | head -n 1 || true)"
   [[ -z "$ZONE" ]] && echo "❌ Không tìm thấy Zone nào trong region $REGION." && exit 1
 fi
@@ -120,8 +134,9 @@ echo
 #######################################
 # BƯỚC 2: TẠO VM MỚI
 #######################################
-echo "=== Bước 2: Tạo các VM mới ==="
+echo "=== Bước 2: Khởi tạo các VM mới ==="
 
+# Tìm index lớn nhất hiện tại
 EXISTING_NAMES="$(gcloud compute instances list --project="$PROJECT" --filter="zone:($ZONE) AND name ~ ^${VM_NAME_PREFIX}-[0-9]+$" --format='value(name)' --quiet || true)"
 MAX_INDEX=0
 if [[ -n "$EXISTING_NAMES" ]]; then
@@ -145,7 +160,9 @@ if [[ "${#NEW_VM_NAMES[@]}" -eq 0 ]]; then
   exit 0
 fi
 
-echo "⏳ Đang tạo VM: ${NEW_VM_NAMES[*]} ..."
+echo "⏳ Đang gửi lệnh tạo ${#NEW_VM_NAMES[@]} VM cùng lúc: ${NEW_VM_NAMES[*]} ..."
+echo "   (Quá trình này có thể mất 1-2 phút, vui lòng đợi)"
+
 TMP_ERR="$(mktemp)"
 if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
     --project="$PROJECT" --zone="$ZONE" --machine-type="$MACHINE_TYPE" \
@@ -155,18 +172,22 @@ if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" \
   
   cat "$TMP_ERR"
   if grep -q "IN_USE_ADDRESSES" "$TMP_ERR"; then
-    echo "❗ Lỗi Quota IP. Dừng script."
-    rm -f "$TMP_ERR"
-    exit 0
+    echo
+    echo "❗ Lỗi Quota từ Google Cloud!"
+    echo "   Google báo bạn đã vượt quá giới hạn IP cho phép."
+    echo "   Tuy nhiên, các VM đã được tạo trước khi gặp lỗi vẫn sẽ hoạt động."
+  else
+    echo "❌ Có lỗi xảy ra khi tạo VM."
   fi
   rm -f "$TMP_ERR"
-  exit 1
+  # Không exit ở đây, cố gắng cài proxy cho những con đã tạo được (nếu có)
+else
+  rm -f "$TMP_ERR"
+  echo "✅ Đã tạo xong tất cả các VM."
 fi
-rm -f "$TMP_ERR"
-echo "✅ Tạo VM thành công."
 
 echo
-echo "⏳ Đợi 40 giây cho VM khởi động hoàn tất..."
+echo "⏳ Đợi 40 giây cho các VM khởi động dịch vụ..."
 sleep 40 
 echo
 
@@ -178,6 +199,8 @@ if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
   mkdir -p "$HOME/.ssh"
   ssh-keygen -t rsa -f "$HOME/.ssh/google_compute_engine" -N "" -q
   echo "✅ Đã tạo SSH key."
+else
+  echo "✅ SSH key đã có sẵn."
 fi
 
 #######################################
@@ -187,13 +210,24 @@ echo "=== Bước 4: Cài đặt Proxy song song ==="
 declare -A LOG_FILES
 declare -A PIDS
 
+# Lọc lại danh sách VM thực tế đang chạy (phòng trường hợp lệnh tạo VM fail 1 vài con)
+ACTUAL_RUNNING_VMS=()
 for NAME in "${NEW_VM_NAMES[@]}"; do
+  if gcloud compute instances describe "$NAME" --zone="$ZONE" --format="value(status)" --quiet 2>/dev/null | grep -q "RUNNING"; then
+    ACTUAL_RUNNING_VMS+=("$NAME")
+  fi
+done
+
+if [[ "${#ACTUAL_RUNNING_VMS[@]}" -eq 0 ]]; then
+    echo "❌ Không có VM nào ở trạng thái RUNNING để cài đặt."
+    exit 1
+fi
+
+for NAME in "${ACTUAL_RUNNING_VMS[@]}"; do
   LOG_FILE="/tmp/${NAME}.proxy.log"
   LOG_FILES["$NAME"]="$LOG_FILE"
   echo "▶ Đang cài trên $NAME (log: $LOG_FILE)..."
 
-  # Dùng setsid để tách process tránh bị kill khi terminal đóng (optional)
-  # Thêm StrictHostKeyChecking=no
   gcloud compute ssh "$NAME" \
     --zone="$ZONE" \
     --project="$PROJECT" \
@@ -207,31 +241,31 @@ for NAME in "${NEW_VM_NAMES[@]}"; do
 done
 
 echo
-echo "⏳ Đang đợi tiến trình cài đặt..."
+echo "⏳ Đang chạy script cài đặt trên ${#ACTUAL_RUNNING_VMS[@]} VM..."
 declare -A PROXIES
 FAILED_VMS=()
 
-for NAME in "${NEW_VM_NAMES[@]}"; do
+for NAME in "${ACTUAL_RUNNING_VMS[@]}"; do
   wait "${PIDS[$NAME]}"
   LOG_FILE="${LOG_FILES[$NAME]}"
   
   if grep -q "PROXY:" "$LOG_FILE"; then
     PROXY_LINE="$(grep 'PROXY:' "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')"
     PROXIES["$NAME"]="$PROXY_LINE"
-    echo "✅ $NAME: Xong."
+    echo "✅ $NAME: Thành công."
   else
     FAILED_VMS+=("$NAME")
-    echo "❌ $NAME: Lỗi (Xem log: $LOG_FILE)"
+    echo "❌ $NAME: Thất bại (Xem log: $LOG_FILE)"
   fi
 done
 
 echo
-echo "================= KẾT QUẢ ================="
-for NAME in "${NEW_VM_NAMES[@]}"; do
+echo "================= KẾT QUẢ PROXY ================="
+for NAME in "${ACTUAL_RUNNING_VMS[@]}"; do
   if [[ -n "${PROXIES[$NAME]:-}" ]]; then
     echo "$NAME: ${PROXIES[$NAME]}"
   else
     echo "$NAME: FAILED"
   fi
 done
-echo "==========================================="
+echo "================================================="
