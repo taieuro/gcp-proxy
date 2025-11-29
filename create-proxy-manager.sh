@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Script Quản Lý Proxy V13 (Rescue Edition)
-# Fix lỗi: VM "rỗng" (chưa cài đặt phần mềm).
-# Cơ chế:
-# 1. Dùng 'find' để tìm file config ở mọi ngóc ngách.
-# 2. Nếu không thấy -> TỰ ĐỘNG CÀI LẠI (Rescue Mode).
+# Script Quản Lý Proxy V14 (Password Manager)
+# Tính năng mới: Thay đổi User:Pass cho Proxy (Hàng loạt hoặc Từng cái).
+# Core: V13 Rescue Logic (Tìm file config thông minh & Tự sửa lỗi).
 # curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-manager.sh | bash
 
-set +e # Chạy chế độ mềm dẻo, không tự thoát khi lỗi
+set +e
 
 #######################################
 # CẤU HÌNH & DATABASE
@@ -60,14 +58,149 @@ check_project() {
 }
 
 #######################################
-# CHỨC NĂNG 2: SCAN & RESCUE (V13)
+# CHỨC NĂNG 4: ĐỔI MẬT KHẨU (NEW)
+#######################################
+update_vm_credentials() {
+  local VM_NAME="$1"
+  local NEW_USER="$2"
+  local NEW_PASS="$3"
+  local VM_IP="$4"
+
+  echo -e "▶ Đang xử lý VM: ${CYAN}$VM_NAME${NC} ($VM_IP)..."
+
+  # Lệnh SSH phức tạp để tìm file, sed thay thế dòng users, và restart service
+  # Sử dụng dấu | làm delimiter cho sed để tránh lỗi ký tự đặc biệt
+  CMD="CONF=\$(sudo find / -name '3proxy.cfg' -print -quit); \
+       if [ -n \"\$CONF\" ]; then \
+         sudo sed -i 's/^users .*/users $NEW_USER:CL:$NEW_PASS/' \"\$CONF\"; \
+         sudo systemctl restart 3proxy || (sudo killall 3proxy && sudo 3proxy \"\$CONF\" &); \
+         # Lấy lại Port để confirm \
+         PORT=\$(grep -E '(proxy|socks) -p' \"\$CONF\" | grep -oP '\-p\K[0-9]+' | head -1); \
+         echo \"SUCCESS:\$PORT\"; \
+       else \
+         echo \"NOT_FOUND\"; \
+       fi"
+
+  LOG_FILE="/tmp/${VM_NAME}.passwd.log"
+  ZONE="$(gcloud compute instances list --filter="name=$VM_NAME" --format="value(zone)" --quiet)"
+  
+  gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --quiet \
+    --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o UserKnownHostsFile=/dev/null" \
+    --command="$CMD" > "$LOG_FILE" 2>&1
+
+  # Kiểm tra kết quả
+  if grep -q "SUCCESS" "$LOG_FILE"; then
+    PORT=$(grep "SUCCESS" "$LOG_FILE" | cut -d: -f2)
+    NEW_PROXY_STR="$VM_IP:$PORT:$NEW_USER:$NEW_PASS"
+    
+    # Cập nhật DB Local (Xóa dòng cũ chứa IP, thêm dòng mới)
+    if [[ -f "$DB_FILE" ]]; then
+      sed -i "/$VM_IP/d" "$DB_FILE"
+    fi
+    echo "$NEW_PROXY_STR" >> "$DB_FILE"
+    
+    echo -e "   ✅ Đổi thành công: ${GREEN}$NEW_PROXY_STR${NC}"
+  else
+    echo -e "   ❌ Thất bại (VM chưa cài proxy hoặc lỗi mạng)."
+  fi
+  rm -f "$LOG_FILE"
+}
+
+change_password_menu() {
+  clear
+  echo -e "${BLUE}=== ĐỔI USER:PASS PROXY ===${NC}"
+  
+  # Lấy danh sách VM đang chạy
+  LIVE_VMS=$(gcloud compute instances list --project="$PROJECT" \
+    --filter="name ~ '^(proxy-vm|us-proxy)-[0-9]+$' AND status=RUNNING" \
+    --format="value(name,networkInterfaces[0].accessConfigs[0].natIP)" 2>/dev/null || true)
+
+  if [[ -z "$LIVE_VMS" ]]; then
+    echo -e "${YELLOW}⚠ Không có Proxy VM nào đang chạy.${NC}"
+    pause_screen
+    return
+  fi
+
+  # Chuyển thành mảng để dễ chọn
+  mapfile -t VM_ARRAY <<< "$LIVE_VMS"
+  TOTAL_VMS=${#VM_ARRAY[@]}
+
+  echo "Tìm thấy $TOTAL_VMS Proxy đang hoạt động."
+  echo "1. 🔄 Đổi đồng loạt cho TẤT CẢ ($TOTAL_VMS VM)"
+  echo "2. 🎯 Chọn từng VM để đổi"
+  echo "0. Quay lại"
+  echo
+  get_input "Lựa chọn (0-2): " MODE
+
+  if [[ "$MODE" == "0" ]]; then return; fi
+
+  # Nhập thông tin User/Pass mới
+  echo
+  echo -e "${YELLOW}Nhập thông tin xác thực mới:${NC}"
+  get_input "New Username: " NEW_USER
+  get_input "New Password: " NEW_PASS
+
+  # Validate input cơ bản
+  if [[ -z "$NEW_USER" || -z "$NEW_PASS" ]]; then
+    echo -e "${RED}Lỗi: User/Pass không được để trống.${NC}"
+    pause_screen; return
+  fi
+  # Chặn ký tự đặc biệt quá dị để tránh lỗi sed/bash
+  if [[ "$NEW_USER" =~ [^a-zA-Z0-9_] || "$NEW_PASS" =~ [^a-zA-Z0-9_] ]]; then
+     echo -e "${YELLOW}⚠ Cảnh báo: Nên dùng chữ cái và số để đảm bảo ổn định nhất.${NC}"
+  fi
+
+  echo
+
+  if [[ "$MODE" == "1" ]]; then
+    # --- BULK UPDATE ---
+    echo "🚀 Bắt đầu cập nhật cho toàn bộ $TOTAL_VMS VM..."
+    for LINE in "${VM_ARRAY[@]}"; do
+      NAME=$(echo "$LINE" | awk '{print $1}')
+      IP=$(echo "$LINE" | awk '{print $2}')
+      update_vm_credentials "$NAME" "$NEW_USER" "$NEW_PASS" "$IP"
+    done
+
+  elif [[ "$MODE" == "2" ]]; then
+    # --- INDIVIDUAL UPDATE ---
+    echo "--- Danh sách VM ---"
+    i=1
+    for LINE in "${VM_ARRAY[@]}"; do
+      NAME=$(echo "$LINE" | awk '{print $1}')
+      IP=$(echo "$LINE" | awk '{print $2}')
+      echo "$i) $NAME - $IP"
+      ((i++))
+    done
+    echo "--------------------"
+    get_input "Nhập số thứ tự VM muốn đổi (ví dụ: 1): " VM_INDEX
+
+    # Validate index
+    if [[ ! "$VM_INDEX" =~ ^[0-9]+$ ]] || (( VM_INDEX < 1 || VM_INDEX > TOTAL_VMS )); then
+      echo -e "${RED}Số thứ tự không hợp lệ.${NC}"
+      pause_screen; return
+    fi
+
+    # Lấy thông tin VM được chọn (index mảng bắt đầu từ 0)
+    SELECTED_LINE="${VM_ARRAY[$((VM_INDEX-1))]}"
+    NAME=$(echo "$SELECTED_LINE" | awk '{print $1}')
+    IP=$(echo "$SELECTED_LINE" | awk '{print $2}')
+    
+    update_vm_credentials "$NAME" "$NEW_USER" "$NEW_PASS" "$IP"
+  fi
+
+  echo
+  echo -e "${GREEN}Hoàn tất quá trình đổi mật khẩu.${NC}"
+  pause_screen
+}
+
+#######################################
+# CHỨC NĂNG 2: SCAN & RESCUE (V13 CORE)
 #######################################
 scan_proxies() {
   clear
   echo -e "${BLUE}=== DANH SÁCH PROXY (IP:PORT:USER:PASS) ===${NC}"
   echo "Đang kiểm tra hệ thống..."
 
-  # 1. Lấy danh sách VM đang chạy
   LIVE_VMS=$(gcloud compute instances list --project="$PROJECT" \
     --filter="name ~ '^(proxy-vm|us-proxy)-[0-9]+$' AND status=RUNNING" \
     --format="value(name,networkInterfaces[0].accessConfigs[0].natIP)" 2>/dev/null || true)
@@ -80,39 +213,29 @@ scan_proxies() {
 
   declare -A VM_IPS
   declare -A MISSING_CREDENTIALS
-  
-  mkdir -p "$(dirname "$DB_FILE")"
-  touch "$DB_FILE"
+  mkdir -p "$(dirname "$DB_FILE")"; touch "$DB_FILE"
   
   while read -r NAME IP; do
     VM_IPS["$NAME"]="$IP"
-    if grep -q "$IP" "$DB_FILE" 2>/dev/null; then
-      : # Đã có trong DB
-    else
+    # Logic mới: Nếu IP có trong DB, ta tin tưởng DB (vì chức năng đổi pass đã update DB rồi)
+    if grep -q "$IP" "$DB_FILE" 2>/dev/null; then :; else
       MISSING_CREDENTIALS["$NAME"]="$IP"
     fi
   done <<< "$LIVE_VMS"
 
-  # 2. Xử lý VM thiếu thông tin
   if [[ ${#MISSING_CREDENTIALS[@]} -gt 0 ]]; then
-    echo -e "${YELLOW}🔎 Phát hiện ${#MISSING_CREDENTIALS[@]} VM chưa có thông tin.${NC}"
-    echo "⏳ Đang quét sâu (Deep Scan) để tìm file cấu hình..."
+    echo -e "${YELLOW}🔎 Phát hiện ${#MISSING_CREDENTIALS[@]} VM chưa có thông tin local.${NC}"
+    echo "⏳ Đang quét server..."
     
     if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
       mkdir -p "$HOME/.ssh"; ssh-keygen -t rsa -f "$HOME/.ssh/google_compute_engine" -N "" -q
     fi
 
-    declare -A PIDS
-    declare -A LOGS
-    
-    # Bước 2a: Thử đọc file config bằng lệnh 'find' (quét toàn ổ đĩa)
+    declare -A PIDS; declare -A LOGS
     for NAME in "${!MISSING_CREDENTIALS[@]}"; do
       LOG_FILE="/tmp/${NAME}.scan.log"
       LOGS["$NAME"]="$LOG_FILE"
-      
-      # Lệnh tìm file 3proxy.cfg ở bất cứ đâu và in nội dung ra
       CMD="sudo find / -name '3proxy.cfg' -print -quit | xargs sudo cat 2>/dev/null"
-      
       gcloud compute ssh "$NAME" --zone="$(gcloud compute instances list --filter="name=$NAME" --format="value(zone)" --quiet)" \
         --project="$PROJECT" --quiet \
         --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o UserKnownHostsFile=/dev/null" \
@@ -120,99 +243,68 @@ scan_proxies() {
       PIDS["$NAME"]=$!
     done
 
-    # Bước 2b: Xử lý kết quả Scan
     RESCUE_LIST=()
-    
     for NAME in "${!MISSING_CREDENTIALS[@]}"; do
       wait "${PIDS[$NAME]}" || true
-      LOG="${LOGS[$NAME]}"
-      IP="${MISSING_CREDENTIALS[$NAME]}"
-      
+      LOG="${LOGS[$NAME]}"; IP="${MISSING_CREDENTIALS[$NAME]}"
       FOUND_CONF=false
       if [[ -s "$LOG" ]]; then
-        # Parse Config
         RAW_USER=$(grep ":CL:" "$LOG" | head -n 1) 
         RAW_PORT=$(grep -E "(proxy|socks) -p" "$LOG" | head -n 1)
-
         if [[ -n "$RAW_USER" && -n "$RAW_PORT" ]]; then
           PORT=$(echo "$RAW_PORT" | grep -oP '\-p\K[0-9]+')
           USER_PASS=$(echo "$RAW_USER" | awk '{print $2}')
           USER=$(echo "$USER_PASS" | awk -F:CL: '{print $1}')
           PASS=$(echo "$USER_PASS" | awk -F:CL: '{print $2}')
-          
-          if [[ -n "$USER" && -n "$PASS" && -n "$PORT" ]]; then
+          if [[ -n "$USER" && -n "$PASS" ]]; then
              FULL_PROXY="$IP:$PORT:$USER:$PASS"
              if ! grep -q "$FULL_PROXY" "$DB_FILE"; then echo "$FULL_PROXY" >> "$DB_FILE"; fi
              FOUND_CONF=true
           fi
         fi
       fi
-      
       if [[ "$FOUND_CONF" == "false" ]]; then
-         echo -e "${RED}⚠ VM '$NAME' rỗng (chưa cài phần mềm).${NC}"
+         echo -e "${RED}⚠ VM '$NAME' trống.${NC}"
          RESCUE_LIST+=("$NAME")
       fi
       rm -f "$LOG"
     done
 
-    # Bước 3: CỨU HỘ (RESCUE MODE) - Cài lại cho VM rỗng
     if [[ ${#RESCUE_LIST[@]} -gt 0 ]]; then
-        echo
-        echo -e "${CYAN}🚑 ĐANG KÍCH HOẠT CHẾ ĐỘ CỨU HỘ (RESCUE MODE)...${NC}"
-        echo "Hệ thống sẽ cài đặt lại Proxy cho ${#RESCUE_LIST[@]} VM bị lỗi."
-        echo "Vui lòng đợi khoảng 1 phút..."
-        
-        declare -A RESCUE_PIDS
-        declare -A RESCUE_LOGS
-
+        echo; echo -e "${CYAN}🚑 ĐANG CỨU HỘ ${#RESCUE_LIST[@]} VM...${NC}"
+        declare -A RESCUE_PIDS; declare -A RESCUE_LOGS
         for NAME in "${RESCUE_LIST[@]}"; do
-            R_LOG="/tmp/${NAME}.rescue.log"
-            RESCUE_LOGS["$NAME"]="$R_LOG"
+            R_LOG="/tmp/${NAME}.rescue.log"; RESCUE_LOGS["$NAME"]="$R_LOG"
             ZONE_R="$(gcloud compute instances list --filter="name=$NAME" --format="value(zone)" --quiet)"
-            
-            echo "▶ Đang cài đặt lại cho: $NAME ..."
             gcloud compute ssh "$NAME" --zone="$ZONE_R" --project="$PROJECT" --quiet \
             --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o UserKnownHostsFile=/dev/null" \
             --command="curl -s $PROXY_INSTALL_URL | sudo bash" > "$R_LOG" 2>&1 &
             RESCUE_PIDS["$NAME"]=$!
         done
-
-        # Đợi cài xong và lấy thông tin
         for NAME in "${RESCUE_LIST[@]}"; do
             wait "${RESCUE_PIDS[$NAME]}" || true
-            R_LOG="${RESCUE_LOGS[$NAME]}"
-            IP="${MISSING_CREDENTIALS[$NAME]}"
-
+            R_LOG="${RESCUE_LOGS[$NAME]}"; IP="${MISSING_CREDENTIALS[$NAME]}"
             if grep -q "PROXY:" "$R_LOG"; then
                 PROXY_LINE="$(grep 'PROXY:' "$R_LOG" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')"
                 if ! grep -q "$PROXY_LINE" "$DB_FILE"; then echo "$PROXY_LINE" >> "$DB_FILE"; fi
-                echo -e "${GREEN}✅ Đã cứu hộ thành công $NAME.${NC}"
+                echo -e "${GREEN}✅ Cứu hộ xong $NAME.${NC}"
             else
-                echo -e "${RED}❌ Cứu hộ thất bại $NAME.${NC} (Xem log: $R_LOG)"
+                echo -e "${RED}❌ Thất bại $NAME.${NC}"
             fi
         done
     fi
     echo
   fi
 
-  # 4. IN KẾT QUẢ CUỐI CÙNG
   echo -e "${GREEN}--------------------------------------------------${NC}"
   COUNT=0
   for NAME in "${!VM_IPS[@]}"; do
     IP="${VM_IPS[$NAME]}"
-    # Tìm dòng chứa IP trong DB (ưu tiên dòng mới nhất)
     INFO=$(grep "$IP" "$DB_FILE" | tail -n 1 || true)
-    
-    if [[ -n "$INFO" ]]; then
-      echo "$INFO"
-      ((COUNT++))
-    else
-      echo -e "${RED}$IP:ERROR${NC} (Vẫn lỗi - Hãy xóa VM này và tạo mới)"
-    fi
+    if [[ -n "$INFO" ]]; then echo "$INFO"; ((COUNT++)); else echo -e "${RED}$IP:ERROR${NC}"; fi
   done
   echo -e "${GREEN}--------------------------------------------------${NC}"
   echo "Tổng: $COUNT proxy hoạt động."
-  
   pause_screen
 }
 
@@ -227,17 +319,13 @@ create_proxy_menu() {
   1) Tokyo
   2) Osaka
   3) Seoul
-
---- MỸ (Rẻ & Xanh) ---
-  4) Oregon   (Low CO2)
-  5) Iowa     (RẺ NHẤT)
-  6) Virginia (Low CO2)
-
+--- MỸ ---
+  4) Oregon (Low CO2)
+  5) Iowa   (RẺ NHẤT)
+  6) Virginia
   0) Quay lại
 SUBMENU
-
   get_input "Chọn (0-6): " REGION_CHOICE
-
   VM_NAME_PREFIX="proxy-vm"
   case "$REGION_CHOICE" in
     1) REGION="asia-northeast1"; LBL="Tokyo" ;;
@@ -249,10 +337,7 @@ SUBMENU
     0) return ;;
     *) echo "Sai."; sleep 1; return ;;
   esac
-
   echo -e "\nKhu vực: ${GREEN}$LBL${NC}"
-
-  # Check Quota
   JSON_DATA=$(gcloud compute regions describe "$REGION" --project="$PROJECT" --format="json" --quiet 2>/dev/null || true)
   NUM_VMS=1
   if [[ -n "$JSON_DATA" ]]; then
@@ -266,13 +351,9 @@ try:
             print(f\"{q['limit']} {q['usage']}\")
             found = True
             break
-    if not found:
-        print(\"ERROR ERROR\")
-except:
-    print(\"ERROR ERROR\")
-")
+    if not found: print(\"ERROR ERROR\")
+except: print(\"ERROR ERROR\")")
   fi
-
   if [[ "$LIMIT_VAL" != "ERROR" && -n "$LIMIT_VAL" ]]; then
       LIMIT_INT="${LIMIT_VAL%.*}"; USAGE_INT="${USAGE_VAL%.*}"
       REMAINING=$((LIMIT_INT - USAGE_INT))
@@ -280,17 +361,12 @@ except:
       if (( REMAINING <= 0 )); then echo "Hết Quota."; pause_screen; return; fi
       NUM_VMS="$REMAINING"
   fi
-  
   echo "=> Tạo: $NUM_VMS VM."
-
-  # Create
   ZONE="$(gcloud compute zones list --filter="region:($REGION) AND status=UP" --quiet --format='value(name)' | head -n 1 || true)"
   [[ -z "$ZONE" ]] && echo "Lỗi Zone." && return
-
   if ! gcloud compute firewall-rules describe "$FIREWALL_NAME" --project="$PROJECT" --quiet >/dev/null 2>&1; then
     gcloud compute firewall-rules create "$FIREWALL_NAME" --project="$PROJECT" --network="$NETWORK" --direction=INGRESS --priority=1000 --action=ALLOW --rules=tcp:20000-60000 --source-ranges=0.0.0.0/0 --target-tags="proxy-vm" --quiet
   fi
-
   EXISTING_NAMES="$(gcloud compute instances list --project="$PROJECT" --filter="zone:($ZONE) AND name ~ ^${VM_NAME_PREFIX}-[0-9]+$" --format='value(name)' --quiet || true)"
   MAX_INDEX=0
   if [[ -n "$EXISTING_NAMES" ]]; then
@@ -300,42 +376,28 @@ except:
       [[ "$IDX" =~ ^[0-9]+$ ]] && (( IDX > MAX_INDEX )) && MAX_INDEX=$IDX
     done <<< "$EXISTING_NAMES"
   fi
-
   START_INDEX=$((MAX_INDEX + 1)); END_INDEX=$((MAX_INDEX + NUM_VMS))
   NEW_VM_NAMES=()
   for ((i=START_INDEX; i<=END_INDEX; i++)); do NEW_VM_NAMES+=("${VM_NAME_PREFIX}-${i}"); done
-
   echo -e "🚀 Đang tạo VM..."
   TMP_ERR="$(mktemp)"
-  if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" --project="$PROJECT" --zone="$ZONE" --machine-type="$MACHINE_TYPE" --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT" --boot-disk-size="$DISK_SIZE" --boot-disk-type="$DISK_TYPE" --network="$NETWORK" --tags="$TAGS" --quiet 2>"$TMP_ERR"; then
-    cat "$TMP_ERR"
-  fi
+  if ! gcloud compute instances create "${NEW_VM_NAMES[@]}" --project="$PROJECT" --zone="$ZONE" --machine-type="$MACHINE_TYPE" --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT" --boot-disk-size="$DISK_SIZE" --boot-disk-type="$DISK_TYPE" --network="$NETWORK" --tags="$TAGS" --quiet 2>"$TMP_ERR"; then cat "$TMP_ERR"; fi
   rm -f "$TMP_ERR"
-
-  echo "⏳ Đợi 40s..."
-  sleep 40
-
-  # Install
-  if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
-    mkdir -p "$HOME/.ssh"; ssh-keygen -t rsa -f "$HOME/.ssh/google_compute_engine" -N "" -q
-  fi
-  
+  echo "⏳ Đợi 40s..."; sleep 40
+  if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then mkdir -p "$HOME/.ssh"; ssh-keygen -t rsa -f "$HOME/.ssh/google_compute_engine" -N "" -q; fi
   ACTUAL_RUNNING_VMS=()
   for NAME in "${NEW_VM_NAMES[@]}"; do
     STATUS=$(gcloud compute instances describe "$NAME" --zone="$ZONE" --format="value(status)" --quiet 2>/dev/null || true)
     [[ "$STATUS" == "RUNNING" ]] && ACTUAL_RUNNING_VMS+=("$NAME")
   done
-
   if [[ "${#ACTUAL_RUNNING_VMS[@]}" -gt 0 ]]; then
     echo "📦 Cài đặt..."
     declare -A LOG_FILES; declare -A PIDS
     for NAME in "${ACTUAL_RUNNING_VMS[@]}"; do
-      LOG_FILE="/tmp/${NAME}.proxy.log"
-      LOG_FILES["$NAME"]="$LOG_FILE"
+      LOG_FILE="/tmp/${NAME}.proxy.log"; LOG_FILES["$NAME"]="$LOG_FILE"
       gcloud compute ssh "$NAME" --zone="$ZONE" --project="$PROJECT" --quiet --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o UserKnownHostsFile=/dev/null" --command="curl -s $PROXY_INSTALL_URL | sudo bash" >"$LOG_FILE" 2>&1 &
       PIDS["$NAME"]=$!
     done
-
     mkdir -p "$(dirname "$DB_FILE")"; touch "$DB_FILE"
     for NAME in "${ACTUAL_RUNNING_VMS[@]}"; do
       wait "${PIDS[$NAME]}" || true
@@ -344,9 +406,7 @@ except:
         PROXY_LINE="$(grep 'PROXY:' "$LOG_FILE" | tail -n 1 | sed 's/^.*PROXY:[[:space:]]*//')"
         echo "$PROXY_LINE" >> "$DB_FILE"
         echo -e "$NAME: ${GREEN}$PROXY_LINE${NC}"
-      else
-        echo -e "$NAME: ${RED}FAILED${NC}"
-      fi
+      else echo -e "$NAME: ${RED}FAILED${NC}"; fi
     done
   fi
   pause_screen
@@ -359,17 +419,19 @@ check_project
 while true; do
   clear
   echo -e "${BLUE}========================================${NC}"
-  echo -e "${BLUE}   GOOGLE CLOUD PROXY MANAGER (V13)     ${NC}"
+  echo -e "${BLUE}   GOOGLE CLOUD PROXY MANAGER (V14)     ${NC}"
   echo -e "${BLUE}========================================${NC}"
   echo "1. 🚀 Tạo Proxy Mới"
-  echo "2. 🚑 Quét & Cứu Hộ Proxy Lỗi (Scan & Repair)"
-  echo "3. 🚪 Thoát"
+  echo "2. 📋 Xem Danh Sách & Cứu Hộ"
+  echo "3. 🔑 Đổi Mật Khẩu Proxy (New)"
+  echo "4. 🚪 Thoát"
   echo
-  get_input "Chọn (1-3): " CHOICE
+  get_input "Chọn (1-4): " CHOICE
   case "$CHOICE" in
     1) create_proxy_menu ;;
     2) scan_proxies ;;
-    3) exit 0 ;;
+    3) change_password_menu ;;
+    4) exit 0 ;;
     *) ;;
   esac
 done
