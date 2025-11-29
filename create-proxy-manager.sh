@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Script Quản Lý Proxy V11 (Resilient Edition)
-# Fix lỗi: Crash khi Deep Scan gặp VM không kết nối được.
-# Cơ chế: Safe Mode cho Scan + Auto Recovery Pass.
-
-# Tắt cờ -e để tránh crash khi scan lỗi, ta sẽ quản lý lỗi thủ công
-# set -eo pipefail --> Đã bỏ dòng này ở global, xử lý cục bộ
+# Script Quản Lý Proxy V12 (Root Access Edition)
+# Fix lỗi: "Failed_To_Recover" do thiếu quyền đọc file config.
+# Giải pháp: Thêm 'sudo' vào lệnh đọc file và cải thiện thuật toán parse Regex.
 # curl -s https://raw.githubusercontent.com/taieuro/gcp-proxy/main/create-proxy-manager.sh | bash
+
+set +e # Tắt chế độ tự thoát lỗi để quản lý luồng tốt hơn
 
 #######################################
 # CẤU HÌNH & DATABASE
@@ -58,12 +57,9 @@ check_project() {
 }
 
 #######################################
-# CHỨC NĂNG 2: SCAN & RECOVER (FIXED)
+# CHỨC NĂNG 2: SCAN & RECOVER (V12 FIX)
 #######################################
 scan_proxies() {
-  # Bật chế độ Safe Mode: Không thoát script nếu lệnh con bị lỗi
-  set +e
-  
   clear
   echo -e "${BLUE}=== DANH SÁCH PROXY (IP:PORT:USER:PASS) ===${NC}"
   echo "Đang đối chiếu dữ liệu..."
@@ -83,7 +79,6 @@ scan_proxies() {
   declare -A VM_IPS
   declare -A MISSING_CREDENTIALS
   
-  # Tạo file DB nếu chưa có
   mkdir -p "$(dirname "$DB_FILE")"
   touch "$DB_FILE"
   
@@ -97,10 +92,10 @@ scan_proxies() {
     fi
   done <<< "$LIVE_VMS"
 
-  # 3. Deep Scan (Recover Pass)
+  # 3. Deep Scan (Recover Pass) - V12 LOGIC
   if [[ ${#MISSING_CREDENTIALS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}🔎 Phát hiện ${#MISSING_CREDENTIALS[@]} Proxy chưa có thông tin Login.${NC}"
-    echo "⏳ Đang SSH khôi phục (Vui lòng đợi 10-20s)..."
+    echo "⏳ Đang SSH lấy quyền root để đọc file config..."
     
     # Check SSH Key
     if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
@@ -114,10 +109,10 @@ scan_proxies() {
       LOG_FILE="/tmp/${NAME}.recover.log"
       LOGS["$NAME"]="$LOG_FILE"
       
-      # Lệnh lấy pass từ file config
-      CMD="cat /etc/3proxy/3proxy.cfg 2>/dev/null || cat /etc/3proxy/conf/3proxy.cfg"
+      # FIX QUAN TRỌNG: Thêm 'sudo' vào trước lệnh cat
+      # Thử đọc ở nhiều đường dẫn phổ biến của 3proxy
+      CMD="sudo cat /etc/3proxy/3proxy.cfg 2>/dev/null || sudo cat /usr/local/etc/3proxy/3proxy.cfg 2>/dev/null || sudo cat /usr/local/3proxy/conf/3proxy.cfg"
       
-      # Chạy ngầm, thêm || true để không crash
       gcloud compute ssh "$NAME" --zone="$(gcloud compute instances list --filter="name=$NAME" --format="value(zone)" --quiet)" \
         --project="$PROJECT" --quiet \
         --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o UserKnownHostsFile=/dev/null" \
@@ -127,30 +122,44 @@ scan_proxies() {
 
     # Thu thập kết quả
     for NAME in "${!MISSING_CREDENTIALS[@]}"; do
-      # QUAN TRỌNG: wait || true để tránh crash nếu SSH fail
       wait "${PIDS[$NAME]}" || true
-      
       LOG="${LOGS[$NAME]}"
       IP="${MISSING_CREDENTIALS[$NAME]}"
       
       if [[ -f "$LOG" ]]; then
-        RAW_USER=$(grep -m 1 "users" "$LOG" || true)
-        RAW_PORT=$(grep -m 1 "proxy -p" "$LOG" || true)
+        # Debug: Kiểm tra xem file log có rỗng không
+        if [[ ! -s "$LOG" ]]; then
+            # Log rỗng -> Lỗi SSH hoặc không tìm thấy file
+            rm -f "$LOG"
+            continue
+        fi
 
-        if [[ -n "$RAW_USER" && -n "$RAW_PORT" ]]; then
-          PORT=$(echo "$RAW_PORT" | grep -oP 'proxy -p\K[0-9]+')
-          USER_PASS=$(echo "$RAW_USER" | awk '{print $2}')
-          USER=$(echo "$USER_PASS" | awk -F:CL: '{print $1}')
-          PASS=$(echo "$USER_PASS" | awk -F:CL: '{print $2}')
+        # Parsing bằng Regex (Mạnh mẽ hơn)
+        # Tìm dòng chứa 'users '
+        RAW_USER_LINE=$(grep "users " "$LOG" | head -n 1) 
+        # Tìm dòng chứa 'proxy -p'
+        RAW_PORT_LINE=$(grep "proxy -p" "$LOG" | head -n 1)
+
+        if [[ -n "$RAW_USER_LINE" && -n "$RAW_PORT_LINE" ]]; then
+          # Extract PORT: Lấy số sau chữ -p
+          PORT=$(echo "$RAW_PORT_LINE" | grep -oP 'proxy -p\K[0-9]+')
           
-          if [[ -n "$USER" && -n "$PASS" ]]; then
+          # Extract USER/PASS: Lấy chuỗi sau 'users '
+          # Format thường gặp: users admin:CL:password
+          USER_PASS_RAW=$(echo "$RAW_USER_LINE" | awk '{print $2}')
+          
+          USER=$(echo "$USER_PASS_RAW" | awk -F:CL: '{print $1}')
+          PASS=$(echo "$USER_PASS_RAW" | awk -F:CL: '{print $2}')
+          
+          if [[ -n "$USER" && -n "$PASS" && -n "$PORT" ]]; then
              FULL_PROXY="$IP:$PORT:$USER:$PASS"
-             # Chỉ ghi vào file nếu chưa tồn tại dòng đó
+             # Lưu vào DB nếu chưa có
              if ! grep -q "$FULL_PROXY" "$DB_FILE"; then
                  echo "$FULL_PROXY" >> "$DB_FILE"
              fi
           fi
         fi
+        # Xóa log sau khi xử lý xong
         rm -f "$LOG"
       fi
     done
@@ -169,7 +178,7 @@ scan_proxies() {
       echo "$INFO"
       ((COUNT++))
     else
-      echo "$IP:Failed_To_Recover (Thử chạy lại hoặc cài lại)"
+      echo -e "${RED}$IP:ERROR${NC} (Không đọc được file config. Thử xóa VM tạo lại)"
     fi
   done
   echo -e "${GREEN}--------------------------------------------------${NC}"
@@ -182,8 +191,6 @@ scan_proxies() {
 # CHỨC NĂNG 1: TẠO PROXY
 #######################################
 create_proxy_menu() {
-  set +e # Tắt exit on error tạm thời cho menu con
-  
   clear
   echo -e "${BLUE}=== TẠO PROXY MỚI ===${NC}"
   cat << 'SUBMENU'
@@ -330,10 +337,10 @@ check_project
 while true; do
   clear
   echo -e "${BLUE}========================================${NC}"
-  echo -e "${BLUE}   GOOGLE CLOUD PROXY MANAGER (V11)     ${NC}"
+  echo -e "${BLUE}   GOOGLE CLOUD PROXY MANAGER (V12)     ${NC}"
   echo -e "${BLUE}========================================${NC}"
   echo "1. 🚀 Tạo Proxy Mới (Create)"
-  echo "2. 📋 Lấy danh sách (IP:Port:User:Pass)"
+  echo "2. 📋 Lấy danh sách & Fix lỗi (Scan)"
   echo "3. 🚪 Thoát"
   echo
   get_input "Chọn (1-3): " CHOICE
