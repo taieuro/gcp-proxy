@@ -461,8 +461,8 @@ while true; do
   echo -e "${BLUE}   GOOGLE CLOUD PROXY MANAGER (V16)     ${NC}"
   echo -e "${BLUE}========================================${NC}"
   echo "1. 🚀 Tạo Proxy Mới"
-  echo "2. 📋 Xem Danh Sách & Cứu Hộ"
-  echo "3. 🔑 Đổi Mật Khẩu Proxy (Fix Port)"
+  echo "2. 📋 Xem Danh Sách Proxy"
+  echo "3. 🔑 Đổi User/Pass Proxy"
   echo "4. 🚪 Thoát"
   echo
   get_input "Chọn (1-4): " CHOICE
