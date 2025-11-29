@@ -17,6 +17,13 @@ CHỨC NĂNG 1:
   1) Tokyo   2) Osaka   3) Seoul
 --- US (LowCost) ---
   4) Oregon  5) Iowa    6) Virginia
+--------------------------------------
+Auto chọn VM RẺ & ỔN ĐỊNH NHẤT Google Cloud:
+e2-micro (Gói rẻ nhất, ổn định cho Proxy)
+debian-12 (không tốn phí OS)
+debian-cloud
+10GB (Size nhỏ nhất cho phép)
+Standard persistent disk (Ổ cứng HDD thường)
 
 CHỨC NĂNG 2:
 === DANH SÁCH IP:PORT:USER:PASS ===
